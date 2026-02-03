@@ -1,0 +1,10 @@
+# NotebookLM Telegram Bot Dependencies
+
+# Telegram Bot API (with job-queue for background sync)
+python-telegram-bot[job-queue]>=21.0
+
+# OpenAI API for smart routing (GPT-4o-mini)
+openai>=1.0.0
+
+# Environment variables
+python-dotenv==1.0.0

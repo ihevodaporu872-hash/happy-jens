@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "E:/ANTIfravity"
+		},
+		{
+			"path": "E:/ERP/ERP/skills"
+		}
+	],
+	"settings": {
+		"java.compile.nullAnalysis.mode": "automatic",
+		"java.configuration.updateBuildConfiguration": "automatic"
+	}
+}
