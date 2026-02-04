@@ -804,7 +804,7 @@ class GeminiFileSearchClient:
         store_id_1: str,
         store_id_2: str,
         topic: str,
-        model: str = "gemini-3-flash-preview"
+        model: str = "gemini-3-pro-preview"  # Pro for complex comparison
     ) -> Optional[str]:
         """
         Compare information about a topic between two stores.
