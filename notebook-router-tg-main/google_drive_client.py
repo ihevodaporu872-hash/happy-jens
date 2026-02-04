@@ -224,18 +224,24 @@ class GoogleDriveClient:
         results = []
         seen_ids = set()
 
-        # Find all URLs in text
-        url_pattern = r'https?://[^\s<>"\'\)]+[a-zA-Z0-9_/-]'
+        # Find all URLs in text (including query params like ?usp=sharing)
+        url_pattern = r'https?://[^\s<>"\']+(?<=[a-zA-Z0-9_/=-])'
         urls = re.findall(url_pattern, text)
+        # Clean trailing punctuation that might be captured
+        urls = [re.sub(r'[,;:!?\)]+$', '', url) for url in urls]
+
+        logger.debug(f"Found raw URLs: {urls}")
 
         for url in urls:
             extracted = GoogleDriveClient.extract_file_id(url)
+            logger.debug(f"URL: {url[:50]}... -> extracted: {extracted}")
             if extracted:
                 file_id, file_type = extracted
                 if file_id not in seen_ids:
                     seen_ids.add(file_id)
                     results.append((url, file_id, file_type))
 
+        logger.debug(f"Final extracted: {[(fid[:10], ftype) for _, fid, ftype in results]}")
         return results[:MAX_URLS_PER_REQUEST]
 
     def get_file_info(self, file_id: str) -> Optional[Dict]:

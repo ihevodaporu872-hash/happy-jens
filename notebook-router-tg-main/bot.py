@@ -47,6 +47,7 @@ from config import (
     MEMORY_FILE,
     MEMORY_MAX_MESSAGES,
     MEMORY_CLEANUP_DAYS,
+    NOTIFICATION_CHANNEL_ID,
 )
 from router import NotebookRouter
 from gemini_client import GeminiFileSearchClient
@@ -1419,6 +1420,9 @@ async def handle_folder_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     folder_urls = [(url, fid, ftype) for url, fid, ftype in urls if ftype == 'folder']
 
     if not folder_urls:
+        # Log for debugging
+        logger.warning(f"No folder URL detected in: {message_text[:100]}...")
+        logger.warning(f"All extracted URLs: {urls}")
         return False  # Not a folder link
 
     if not is_admin(user_id):
@@ -1427,11 +1431,18 @@ async def handle_folder_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return True
 
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return True
+
     url, folder_id, _ = folder_urls[0]
+
+    logger.info(f"Processing folder link: {url}, folder_id: {folder_id}")
 
     await update.message.chat.send_action("typing")
     status_msg = await update.message.reply_text(
-        "Detected Google Drive folder.\n"
+        f"Detected Google Drive folder.\n"
+        f"Folder ID: {folder_id[:20]}...\n"
         "Creating new tender store..."
     )
 
@@ -1726,7 +1737,11 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Check if this is a Google Drive folder link (admin only)
-    if "drive.google.com" in question and "folders" in question:
+    # Use proper URL extraction instead of simple string check
+    detected_urls = GoogleDriveClient.extract_all_urls(question)
+    has_folder_link = any(ftype == 'folder' for _, _, ftype in detected_urls)
+
+    if has_folder_link:
         handled = await handle_folder_link(update, context)
         if handled:
             return
