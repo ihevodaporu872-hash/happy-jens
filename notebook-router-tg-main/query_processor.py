@@ -1,14 +1,14 @@
 """
 Smart Query Processor
 
-Uses Gemini Pro (full model) for complex understanding:
+Uses Gemini 3 Pro for complex understanding:
 1. Understand user intent even with typos/errors
 2. Detect query type (single store, multistore, web search, compare, sources)
 3. Generate optimal prompt for the knowledge store
 
 Model strategy:
-- Gemini Pro: Query analysis, intent detection, prompt optimization
-- Gemini Flash: Simple store queries (handled elsewhere)
+- Gemini 3 Pro (gemini-3-pro-preview): Query analysis, intent detection, prompt optimization
+- Gemini 3 Flash (gemini-3-flash-preview): Simple/medium store queries (handled elsewhere)
 """
 
 import json
@@ -47,16 +47,16 @@ class QueryProcessor:
     - Implicit context from conversation
     """
 
-    def __init__(self, api_key: str, model: str = "gemini-2.5-pro-preview-05-06"):
+    def __init__(self, api_key: str, model: str = "gemini-3-pro-preview"):
         """
         Initialize the processor.
 
         Args:
             api_key: Gemini API key
-            model: Gemini Pro model for complex analysis
+            model: Gemini 3 Pro model for complex analysis
         """
         self.client = genai.Client(api_key=api_key)
-        self.model = model  # Pro model for understanding
+        self.model = model  # Gemini 3 Pro for understanding
 
     def process_query(
         self,

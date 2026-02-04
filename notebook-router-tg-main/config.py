@@ -43,14 +43,13 @@ ALLOWED_USERS = [
 QUERY_TIMEOUT = int(os.getenv("QUERY_TIMEOUT", "60"))
 
 # Gemini 3 models
-# Flash - for simple/medium tasks (fast, cheap)
-GEMINI_MODEL_FLASH = os.getenv("GEMINI_MODEL_FLASH", "gemini-2.0-flash")
+# Flash - for simple/medium tasks (fast, efficient)
+GEMINI_MODEL_FLASH = os.getenv("GEMINI_MODEL_FLASH", "gemini-3-flash-preview")
 # Pro - for complex tasks (query understanding, comparisons, deep analysis)
-GEMINI_MODEL_PRO = os.getenv("GEMINI_MODEL_PRO", "gemini-2.5-pro-preview-05-06")
+GEMINI_MODEL_PRO = os.getenv("GEMINI_MODEL_PRO", "gemini-3-pro-preview")
 
 # Default model (backwards compatibility)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", GEMINI_MODEL_FLASH)
-GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "medium")  # minimal, low, medium, high
 
 # Google Drive Service Account (for /uploadurl command)
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
