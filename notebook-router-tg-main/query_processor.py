@@ -28,12 +28,15 @@ class ProcessedQuery:
     query_type: str  # "single", "multistore", "web_search", "compare", "sources"
     optimized_prompt: str  # Ideal prompt for the store
     include_sources: bool  # Whether to include source citations
+    target_store: Optional[str]  # For single queries: store name
     target_stores: Optional[List[str]]  # For compare: store names
     compare_topic: Optional[str]  # For compare: topic
     original_question: str
     user_intent: str  # Brief description of what user wants
     confidence: float  # 0-1 confidence in interpretation
     complexity: str  # "simple", "medium", "complex" - for model selection
+    action: Optional[str]  # Command-like action intent
+    action_args: Dict  # Args for action
 
 
 class QueryProcessor:
@@ -116,9 +119,15 @@ class QueryProcessor:
     "target_store": "имя store для single запроса или null",
     "compare_stores": ["store1", "store2"] или null,
     "compare_topic": "тема сравнения или null",
+    "action": "none|list_stores|select_store|status|clear_memory|export|add_store|delete_store|rename_store|set_sync|sync_now|upload_url|upload_file|help",
+    "action_args": {{ "store_name": "...", "old_name": "...", "new_name": "...", "urls": ["..."], "format": "pdf|docx", "question": "..." }},
     "confidence": 0.0-1.0,
     "complexity": "simple|medium|complex"
 }}
+
+ПРАВИЛО ДЛЯ action:
+- Используй action ТОЛЬКО если пользователь явно просит выполнить действие (список, выбор, экспорт, переименование и т.п.)
+- Если это обычный вопрос к документам — action = "none"
 
 ПРАВИЛА ФОРМИРОВАНИЯ optimized_prompt:
 1. Исправь все ошибки и опечатки
@@ -157,12 +166,15 @@ JSON:"""
                 query_type="single",
                 optimized_prompt=question,
                 include_sources=False,
+                target_store=None,
                 target_stores=None,
                 compare_topic=None,
                 original_question=question,
                 user_intent="Не удалось определить",
                 confidence=0.0,
-                complexity="medium"
+                complexity="medium",
+                action=None,
+                action_args={}
             )
 
     def _format_stores_info(self, stores: List[Dict]) -> str:
@@ -194,12 +206,15 @@ JSON:"""
             query_type=data.get("query_type", "single"),
             optimized_prompt=data.get("optimized_prompt", original_question),
             include_sources=data.get("include_sources", False),
+            target_store=data.get("target_store"),
             target_stores=data.get("compare_stores"),
             compare_topic=data.get("compare_topic"),
             original_question=original_question,
             user_intent=data.get("user_intent", ""),
             confidence=float(data.get("confidence", 0.5)),
-            complexity=data.get("complexity", "medium")
+            complexity=data.get("complexity", "medium"),
+            action=data.get("action"),
+            action_args=data.get("action_args") or {}
         )
 
     def enhance_for_store(

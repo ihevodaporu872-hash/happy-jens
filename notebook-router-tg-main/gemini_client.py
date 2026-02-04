@@ -392,6 +392,54 @@ class GeminiFileSearchClient:
                 return store
         return None
 
+    def find_store_by_name(self, name: str) -> Optional[Dict]:
+        """
+        Find store by name with fuzzy matching.
+
+        - Exact match (case-insensitive)
+        - Partial match (name in store name or vice versa)
+        - Best word overlap
+        """
+        if not name:
+            return None
+
+        name_lower = name.lower().strip()
+        exact = self.get_store_by_name(name_lower)
+        if exact:
+            return exact
+
+        best_match = None
+        best_score = 0.0
+
+        name_words = set(name_lower.split())
+
+        for store in self.stores:
+            store_name = store.get("name", "")
+            store_lower = store_name.lower()
+
+            if not store_lower:
+                continue
+
+            # Partial containment
+            if name_lower in store_lower or store_lower in name_lower:
+                score = len(name_lower) / max(len(store_lower), 1)
+                if score > best_score:
+                    best_score = score
+                    best_match = store
+                continue
+
+            # Word overlap
+            store_words = set(store_lower.split())
+            if name_words and store_words:
+                common = name_words & store_words
+                if common:
+                    score = len(common) / max(len(name_words), len(store_words))
+                    if score > best_score:
+                        best_score = score
+                        best_match = store
+
+        return best_match
+
     def get_store_by_id(self, store_id: str) -> Optional[Dict]:
         """Find store by ID."""
         for store in self.stores:

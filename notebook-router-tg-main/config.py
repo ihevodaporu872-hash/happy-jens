@@ -27,6 +27,9 @@ STORES_FILE = Path(__file__).parent / "stores.json"
 # User memory file path
 MEMORY_FILE = Path(__file__).parent / "user_memory.json"
 
+# User state file path (selected store per user)
+USER_STATE_FILE = Path(__file__).parent / "user_state.json"
+
 # Memory settings
 MEMORY_MAX_MESSAGES = int(os.getenv("MEMORY_MAX_MESSAGES", "5"))
 MEMORY_CLEANUP_DAYS = int(os.getenv("MEMORY_CLEANUP_DAYS", "7"))
@@ -41,6 +44,9 @@ ALLOWED_USERS = [
 
 # Timeouts
 QUERY_TIMEOUT = int(os.getenv("QUERY_TIMEOUT", "60"))
+
+# Confidence threshold for command-like intent actions
+ACTION_CONFIDENCE_THRESHOLD = float(os.getenv("ACTION_CONFIDENCE_THRESHOLD", "0.6"))
 
 # Gemini 3 models
 # Flash - for simple/medium tasks (fast, efficient)

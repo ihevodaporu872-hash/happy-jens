@@ -13,7 +13,10 @@ No OpenAI dependency. Pure Gemini 3.
 import logging
 import sys
 import re
+import tempfile
+import uuid
 from pathlib import Path
+from typing import Optional, Tuple
 
 from datetime import time, datetime
 
@@ -34,10 +37,11 @@ from config import (
     QUERY_TIMEOUT,
     ADMIN_USER_ID,
     STORES_FILE,
+    USER_STATE_FILE,
     GEMINI_MODEL,
     GEMINI_MODEL_FLASH,
     GEMINI_MODEL_PRO,
-    GEMINI_THINKING_LEVEL,
+    ACTION_CONFIDENCE_THRESHOLD,
     GOOGLE_SERVICE_ACCOUNT_FILE,
     IMAGE_DEFAULT_PROMPT,
     MEMORY_FILE,
@@ -50,6 +54,8 @@ from query_processor import QueryProcessor
 from google_drive_client import GoogleDriveClient
 from memory_client import UserMemoryClient
 from export_client import ExportClient
+from user_state import UserStateClient
+from intent_utils import infer_action_from_text, extract_target_store_hint
 
 # Setup logging
 logging.basicConfig(
@@ -92,6 +98,10 @@ else:
 memory_client = UserMemoryClient(MEMORY_FILE, max_messages=MEMORY_MAX_MESSAGES)
 logger.info(f"Memory client initialized (max {MEMORY_MAX_MESSAGES} messages per context)")
 
+# Initialize user state client (selected store per user)
+user_state = UserStateClient(USER_STATE_FILE)
+logger.info("User state client initialized")
+
 # Initialize export client
 export_client = ExportClient()
 logger.info("Export client initialized")
@@ -113,6 +123,31 @@ def check_user_allowed(user_id: int) -> bool:
 def is_admin(user_id: int) -> bool:
     """Check if user is the admin"""
     return ADMIN_USER_ID is not None and user_id == ADMIN_USER_ID
+
+
+def _make_temp_path(prefix: str, suffix: str) -> Path:
+    temp_dir = Path(tempfile.gettempdir()) / "notebook_router_bot"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{prefix}_{uuid.uuid4().hex}{suffix}"
+    return temp_dir / filename
+
+
+def _resolve_store_by_name(name: str) -> Optional[dict]:
+    if not gemini_client or not name:
+        return None
+    return gemini_client.find_store_by_name(name)
+
+
+def _get_selected_store_for_user(user_id: int) -> Optional[dict]:
+    if not gemini_client:
+        return None
+    state = user_state.get_selected_store(user_id)
+    if not state:
+        return None
+    store_id = state.get("selected_store_id")
+    if store_id:
+        return gemini_client.get_store_by_id(store_id)
+    return None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,14 +173,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Smart routing: {routing_status}\n"
         f"Google Drive: {drive_status}\n"
         f"Stores: {stores_count}\n\n"
-        "Commands:\n"
-        "/list - Show all stores\n"
+        "Commands (aliases):\n"
+        "/list or /stores - Show all stores\n"
+        "/select <store> - Select active store\n"
         "/status - Check status\n"
         "/think <question> - Deep thinking mode\n"
         "/clear - Clear conversation history\n"
         "/compare <s1> <s2> <topic> - Compare stores\n"
         "/export - Export last answer to PDF/DOCX\n"
-        "/add - Add new store (admin)\n"
+        "/add or /addstore - Add new store (admin)\n"
+        "/delete or /deletestore - Delete store (admin)\n"
+        "/rename <old> | <new> - Rename store (admin)\n"
         "/upload - Upload file (admin)\n"
         "/uploadurl - Upload from Google URL (admin)\n"
         "/setsync - Configure auto-sync URLs (admin)\n"
@@ -155,6 +193,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Google Drive folder link to auto-create store (admin)\n"
         "- Photo to analyze (add caption for custom prompt)\n"
         "- Voice message to ask questions\n\n"
+        "You can also use natural language, e.g.:\n"
+        "- \"Покажи список тендеров\"\n"
+        "- \"Выбери тендер Дубровка\"\n"
+        "- \"Сделай экспорт в PDF\"\n\n"
         "Bot remembers last 5 messages per store for context.\n"
         "Use PDF/DOCX buttons under answers to export."
     )
@@ -255,7 +297,7 @@ async def upload_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please specify store name: /upload <store_name>")
         return
 
-    store = gemini_client.get_store_by_name(store_name)
+    store = gemini_client.find_store_by_name(store_name)
     if not store:
         await update.message.reply_text(f"Store not found: {store_name}")
         return
@@ -264,7 +306,8 @@ async def upload_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         file = await document.get_file()
-        temp_path = Path(f"/tmp/{document.file_name}")
+        suffix = Path(document.file_name).suffix if document.file_name else ""
+        temp_path = _make_temp_path("upload", suffix)
         await file.download_to_drive(temp_path)
 
         await status_msg.edit_text(f"Uploading to '{store_name}'...")
@@ -354,7 +397,7 @@ async def upload_from_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store_name = parts[0]
     urls_text = parts[1] if len(parts) > 1 else ""
 
-    store = gemini_client.get_store_by_name(store_name)
+    store = gemini_client.find_store_by_name(store_name)
     if not store:
         await update.message.reply_text(f"Store not found: {store_name}")
         return
@@ -492,11 +535,51 @@ async def list_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def select_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /select command - set active store for user"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    args_text = re.sub(r'^/select\\s*', '', update.message.text, flags=re.IGNORECASE).strip()
+    if not args_text:
+        current = _get_selected_store_for_user(user_id)
+        current_name = current.get("name") if current else "None"
+        await update.message.reply_text(
+            "Usage: /select <store_name>\n"
+            "Example: /select Дубровка\n\n"
+            f"Current selected store: {current_name}"
+        )
+        return
+
+    if args_text.lower() in ("clear", "reset", "none", "сброс", "очистить"):
+        user_state.clear_selected_store(user_id)
+        await update.message.reply_text("Selected store cleared. Router will choose automatically.")
+        return
+
+    store = gemini_client.find_store_by_name(args_text)
+    if not store:
+        await update.message.reply_text(f"Store not found: {args_text}")
+        return
+
+    user_state.set_selected_store(user_id, store["id"], store.get("name", args_text))
+    await update.message.reply_text(f"Selected store: {store.get('name')}")
+
+
 async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /status command"""
     if not check_user_allowed(update.effective_user.id):
         await update.message.reply_text("Access denied.")
         return
+
+    selected_store = _get_selected_store_for_user(update.effective_user.id)
+    selected_name = selected_store.get("name") if selected_store else "None"
 
     if drive_client and drive_client.is_configured():
         drive_status = "OK (Service Account)"
@@ -510,6 +593,7 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- Query processor: {'OK' if query_processor else 'Not configured'}",
         f"- Google Drive: {drive_status}",
         f"- Stores: {len(gemini_client.stores) if gemini_client else 0}",
+        f"- Selected store: {selected_name}",
         f"- Model Flash: {GEMINI_MODEL_FLASH}",
         f"- Model Pro: {GEMINI_MODEL_PRO}",
         "",
@@ -566,17 +650,89 @@ async def delete_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /delete <store_name>")
         return
 
-    store = gemini_client.get_store_by_name(args_text)
+    store = gemini_client.find_store_by_name(args_text)
     if not store:
         await update.message.reply_text(f"Store not found: {args_text}")
         return
 
     if gemini_client.delete_store(store["id"]):
+        user_state.clear_store_for_all(store["id"])
         if router:
             router.reload_library()
         await update.message.reply_text(f"Deleted: {args_text}")
     else:
         await update.message.reply_text("Failed to delete. Check logs.")
+
+
+async def rename_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /rename command - rename a store (admin only)"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not is_admin(user_id):
+        await update.message.reply_text("Only admin can rename stores.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    args_text = re.sub(r'^/rename\\s*', '', update.message.text, flags=re.IGNORECASE).strip()
+    if not args_text:
+        await update.message.reply_text(
+            "Usage: /rename <old_name> | <new_name>\n"
+            "Example: /rename ТендерА | ТендерА (обновлено)"
+        )
+        return
+
+    old_name = None
+    new_name = None
+
+    if "|" in args_text:
+        parts = [p.strip() for p in args_text.split("|", 1)]
+        if len(parts) == 2:
+            old_name, new_name = parts
+    else:
+        # Try common separators
+        for sep in ("->", "—", "–", " to ", " в ", " на "):
+            if sep in args_text:
+                parts = [p.strip() for p in args_text.split(sep, 1)]
+                if len(parts) == 2:
+                    old_name, new_name = parts
+                break
+
+    if not old_name or not new_name:
+        await update.message.reply_text(
+            "Could not parse names. Use format:\n"
+            "/rename <old_name> | <new_name>"
+        )
+        return
+
+    store = gemini_client.find_store_by_name(old_name)
+    if not store:
+        await update.message.reply_text(f"Store not found: {old_name}")
+        return
+
+    store_name_before = store.get("name", old_name)
+
+    if gemini_client.update_store_metadata(store["id"], name=new_name):
+        # Update user state if this store was selected
+        selected = user_state.get_selected_store(user_id)
+        if selected and selected.get("selected_store_id") == store["id"]:
+            user_state.set_selected_store(user_id, store["id"], new_name)
+
+        if router:
+            router.reload_library()
+
+        await update.message.reply_text(
+            f"Renamed store:\n"
+            f"{store_name_before} -> {new_name}"
+        )
+    else:
+        await update.message.reply_text("Failed to rename store. Check logs.")
 
 
 async def handle_think(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -667,7 +823,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Download photo
         file = await photo.get_file()
-        temp_path = Path(f"/tmp/photo_{photo.file_id}.jpg")
+        temp_path = _make_temp_path("photo", ".jpg")
         await file.download_to_drive(temp_path)
 
         # Analyze with Gemini
@@ -712,7 +868,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Download voice message
         file = await voice.get_file()
-        temp_path = Path(f"/tmp/voice_{voice.file_id}.ogg")
+        temp_path = _make_temp_path("voice", ".ogg")
         await file.download_to_drive(temp_path)
 
         # Transcribe with Gemini
@@ -817,7 +973,7 @@ async def set_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store_name = parts[0]
     urls_text = parts[1] if len(parts) > 1 else ""
 
-    store = gemini_client.get_store_by_name(store_name)
+    store = gemini_client.find_store_by_name(store_name)
     if not store:
         await update.message.reply_text(f"Store not found: {store_name}")
         return
@@ -866,7 +1022,7 @@ async def sync_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if args_text:
         # Sync specific store
-        store = gemini_client.get_store_by_name(args_text)
+        store = gemini_client.find_store_by_name(args_text)
         if not store:
             await update.message.reply_text(f"Store not found: {args_text}")
             return
@@ -1049,8 +1205,8 @@ async def compare_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     store_name_1, store_name_2, topic = parts
 
-    store_1 = gemini_client.get_store_by_name(store_name_1)
-    store_2 = gemini_client.get_store_by_name(store_name_2)
+    store_1 = gemini_client.find_store_by_name(store_name_1)
+    store_2 = gemini_client.find_store_by_name(store_name_2)
 
     if not store_1:
         await update.message.reply_text(f"Store not found: {store_name_1}")
@@ -1114,9 +1270,12 @@ async def export_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args_text:
         # User provided a new question - process it and export
         await update.message.reply_text(
-            "Processing your question for export...\n"
-            "Use /export without arguments to export the last answer."
+            "Processing your question for export..."
         )
+        # Reuse normal flow: answer the question, then user can export
+        context.user_data["force_question_mode"] = True
+        update.message.text = args_text
+        await handle_question(update, context)
         return
 
     if not last_response:
@@ -1350,6 +1509,160 @@ async def handle_folder_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return True
 
 
+def _pick_action(processed, question: str) -> Tuple[Optional[str], dict]:
+    action = None
+    action_args = {}
+
+    if processed and processed.action and processed.action != "none":
+        if processed.confidence >= ACTION_CONFIDENCE_THRESHOLD:
+            action = processed.action
+            action_args = processed.action_args or {}
+
+    if not action:
+        action, action_args = infer_action_from_text(question)
+
+    if not isinstance(action_args, dict):
+        action_args = {}
+
+    return action, action_args
+
+
+def _build_command_text(command: str, *parts: str) -> str:
+    clean_parts = [p for p in parts if p]
+    if clean_parts:
+        return f"/{command} " + " ".join(clean_parts)
+    return f"/{command}"
+
+
+async def _dispatch_action_intent(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+    action_args: dict,
+    question_text: str
+) -> bool:
+    """Execute command-like action intents. Returns True if handled."""
+    if not action:
+        return False
+
+    # Simple actions
+    if action in ("list_stores", "stores"):
+        await list_stores(update, context)
+        return True
+    if action == "status":
+        await check_status(update, context)
+        return True
+    if action == "clear_memory":
+        await clear_memory(update, context)
+        return True
+    if action == "help":
+        await start(update, context)
+        return True
+
+    # Select store
+    if action == "select_store":
+        store_name = action_args.get("store_name") or extract_target_store_hint(question_text)
+        if not store_name:
+            await update.message.reply_text(
+                "Please specify a store name.\nExample: \"Выбери тендер Дубровка\""
+            )
+            return True
+        update.message.text = _build_command_text("select", store_name)
+        await select_store(update, context)
+        return True
+
+    # Add store (admin)
+    if action == "add_store":
+        store_name = action_args.get("store_name") or action_args.get("name")
+        description = action_args.get("description", "")
+        if not store_name:
+            await update.message.reply_text(
+                "Please specify a store name.\nExample: \"Создай тендер Дубровка | Земляные работы\""
+            )
+            return True
+        update.message.text = f"/add {store_name} | {description}" if description else f"/add {store_name}"
+        await add_store(update, context)
+        return True
+
+    # Delete store (admin)
+    if action == "delete_store":
+        store_name = action_args.get("store_name") or extract_target_store_hint(question_text)
+        if not store_name:
+            await update.message.reply_text(
+                "Please specify a store name to delete.\nExample: \"Удалить тендер Дубровка\""
+            )
+            return True
+        update.message.text = _build_command_text("delete", store_name)
+        await delete_store(update, context)
+        return True
+
+    # Rename store (admin)
+    if action == "rename_store":
+        old_name = action_args.get("old_name")
+        new_name = action_args.get("new_name")
+        if not old_name or not new_name:
+            await update.message.reply_text(
+                "Please provide old and new store names.\n"
+                "Example: \"Переименуй тендер Дубровка в Дубровка (2026)\""
+            )
+            return True
+        update.message.text = f"/rename {old_name} | {new_name}"
+        await rename_store(update, context)
+        return True
+
+    # Export
+    if action == "export":
+        await export_response(update, context)
+        return True
+
+    # Sync related (admin)
+    if action == "sync_now":
+        store_name = action_args.get("store_name")
+        update.message.text = _build_command_text("syncnow", store_name) if store_name else "/syncnow"
+        await sync_now(update, context)
+        return True
+
+    if action == "set_sync":
+        store_name = action_args.get("store_name") or extract_target_store_hint(question_text)
+        urls = action_args.get("urls") or [u for u, _, _ in GoogleDriveClient.extract_all_urls(question_text)]
+        if not store_name or not urls:
+            await update.message.reply_text(
+                "Please specify store and URLs.\n"
+                "Example: \"Настрой синхронизацию для Дубровка https://docs.google.com/...\""
+            )
+            return True
+        update.message.text = f"/setsync {store_name} " + " ".join(urls)
+        await set_sync(update, context)
+        return True
+
+    if action == "upload_url":
+        store_name = action_args.get("store_name") or extract_target_store_hint(question_text)
+        urls = action_args.get("urls") or [u for u, _, _ in GoogleDriveClient.extract_all_urls(question_text)]
+        if not store_name or not urls:
+            await update.message.reply_text(
+                "Please specify store and Google URL(s).\n"
+                "Example: \"Загрузи в Дубровка https://docs.google.com/...\""
+            )
+            return True
+        update.message.text = f"/uploadurl {store_name} " + " ".join(urls)
+        await upload_from_url(update, context)
+        return True
+
+    if action == "upload_file":
+        store_name = action_args.get("store_name") or extract_target_store_hint(question_text)
+        if not store_name:
+            await update.message.reply_text(
+                "Please specify store name for upload.\n"
+                "Example: \"Загрузи файл в тендер Дубровка\""
+            )
+            return True
+        update.message.text = _build_command_text("upload", store_name)
+        await upload_file(update, context)
+        return True
+
+    return False
+
+
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle user questions with AI-powered understanding and ultrathinking"""
     user_id = update.effective_user.id
@@ -1399,6 +1712,32 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         logger.info(f"Query type: {processed.query_type}, complexity: {processed.complexity}, "
                    f"intent: {processed.user_intent}, confidence: {processed.confidence}")
+
+        # Handle command-like action intents (natural language)
+        force_question_mode = context.user_data.pop("force_question_mode", False)
+        if not force_question_mode:
+            action, action_args = _pick_action(processed, question)
+
+            # Special case: export with an explicit question
+            if action == "export" and action_args.get("question"):
+                export_question = str(action_args.get("question")).strip()
+                if not export_question:
+                    await status_msg.edit_text("Please provide a question for export.")
+                    return
+
+                # Re-process the actual question for proper routing
+                question = export_question
+                processed = query_processor.process_query(
+                    question=question,
+                    available_stores=gemini_client.stores,
+                    conversation_context=conversation_context
+                )
+
+                context.user_data["export_after_answer"] = action_args.get("format")
+            else:
+                handled = await _dispatch_action_intent(update, context, action, action_args, question)
+                if handled:
+                    return
 
         # Select model based on complexity
         # Simple/Medium -> Flash (fast, cheap)
@@ -1454,8 +1793,8 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if processed.query_type == "compare":
             # Handle comparison
             if processed.target_stores and len(processed.target_stores) >= 2:
-                store_1 = gemini_client.get_store_by_name(processed.target_stores[0])
-                store_2 = gemini_client.get_store_by_name(processed.target_stores[1])
+                store_1 = gemini_client.find_store_by_name(processed.target_stores[0])
+                store_2 = gemini_client.find_store_by_name(processed.target_stores[1])
 
                 if store_1 and store_2:
                     await status_msg.edit_text(
@@ -1481,18 +1820,31 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Single store query (default)
-        # Route to best store if multiple available
-        if router and len(gemini_client.stores) > 1:
-            selected, reasoning = router.route_with_reasoning(
-                processed.optimized_prompt,
-                max_notebooks=1
-            )
-            if selected:
-                store = selected[0]
+        # Prefer explicit target store from AI or user selection
+        target_store_name = processed.target_store or extract_target_store_hint(question)
+        store = None
+
+        if target_store_name:
+            store = gemini_client.find_store_by_name(target_store_name)
+
+        if not store:
+            selected_store = _get_selected_store_for_user(user_id)
+            if selected_store:
+                store = selected_store
+
+        # Route to best store if multiple available and no explicit selection
+        if not store:
+            if router and len(gemini_client.stores) > 1:
+                selected, reasoning = router.route_with_reasoning(
+                    processed.optimized_prompt,
+                    max_notebooks=1
+                )
+                if selected:
+                    store = selected[0]
+                else:
+                    store = gemini_client.stores[0]
             else:
                 store = gemini_client.stores[0]
-        else:
-            store = gemini_client.stores[0]
 
         await status_msg.edit_text(
             f"{intent_text}\n\n"
@@ -1558,6 +1910,39 @@ async def _send_answer(status_msg, update, answer, context, question, store_name
     else:
         await status_msg.edit_text(answer, reply_markup=get_export_keyboard())
 
+    # Auto-export if requested in the same flow
+    export_after = context.user_data.pop("export_after_answer", None)
+    if export_after in ("pdf", "docx"):
+        title = question[:50] if question else "Export"
+        if export_after == "pdf":
+            file_path = export_client.export_to_pdf(
+                content=answer,
+                title=title,
+                question=question,
+                store_name=store_name
+            )
+        else:
+            file_path = export_client.export_to_docx(
+                content=answer,
+                title=title,
+                question=question,
+                store_name=store_name
+            )
+
+        if file_path and file_path.exists():
+            with open(file_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=f,
+                    filename=file_path.name,
+                    caption=f"Export: {title}"
+                )
+            file_path.unlink(missing_ok=True)
+        else:
+            await update.message.reply_text(
+                f"Failed to generate {export_after.upper()} export."
+            )
+
 
 async def memory_cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue callback for weekly memory cleanup"""
@@ -1609,12 +1994,17 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("add", add_store))
+    app.add_handler(CommandHandler("addstore", add_store))
     app.add_handler(CommandHandler("upload", upload_file))
     app.add_handler(CommandHandler("uploadurl", upload_from_url))
     app.add_handler(CommandHandler("list", list_stores))
+    app.add_handler(CommandHandler("stores", list_stores))
+    app.add_handler(CommandHandler("select", select_store))
     app.add_handler(CommandHandler("status", check_status))
     app.add_handler(CommandHandler("sync", sync_stores))
     app.add_handler(CommandHandler("delete", delete_store))
+    app.add_handler(CommandHandler("deletestore", delete_store))
+    app.add_handler(CommandHandler("rename", rename_store))
     app.add_handler(CommandHandler("think", handle_think))
     app.add_handler(CommandHandler("clear", clear_memory))
     app.add_handler(CommandHandler("compare", compare_stores))
