@@ -1302,6 +1302,46 @@ async def export_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _send_export_file(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    export_format: str,
+    question: str,
+    answer: str,
+    store_name: str
+) -> bool:
+    """Generate and send export file. Returns True on success."""
+    title = question[:50] if question else "Export"
+
+    if export_format == "pdf":
+        file_path = export_client.export_to_pdf(
+            content=answer,
+            title=title,
+            question=question,
+            store_name=store_name
+        )
+    else:
+        file_path = export_client.export_to_docx(
+            content=answer,
+            title=title,
+            question=question,
+            store_name=store_name
+        )
+
+    if file_path and file_path.exists():
+        with open(file_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=file_path.name,
+                caption=f"Export: {title}"
+            )
+        file_path.unlink(missing_ok=True)
+        return True
+
+    return False
+
+
 async def handle_export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle export format selection callback"""
     query = update.callback_query
@@ -1324,36 +1364,17 @@ async def handle_export_callback(update: Update, context: ContextTypes.DEFAULT_T
     question = last_response.get("question", "")
     answer = last_response.get("answer", "")
     store_name = last_response.get("store", "")
-    title = question[:50] if question else "Export"
 
-    if export_format == "pdf":
-        file_path = export_client.export_to_pdf(
-            content=answer,
-            title=title,
-            question=question,
-            store_name=store_name
-        )
-    else:
-        file_path = export_client.export_to_docx(
-            content=answer,
-            title=title,
-            question=question,
-            store_name=store_name
-        )
+    ok = await _send_export_file(
+        context=context,
+        chat_id=query.message.chat_id,
+        export_format=export_format,
+        question=question,
+        answer=answer,
+        store_name=store_name
+    )
 
-    if file_path and file_path.exists():
-        await query.edit_message_text(f"Sending {export_format.upper()}...")
-
-        with open(file_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=f,
-                filename=file_path.name,
-                caption=f"Export: {title}"
-            )
-
-        # Clean up file
-        file_path.unlink(missing_ok=True)
+    if ok:
         await query.delete_message()
     else:
         await query.edit_message_text(
@@ -1612,7 +1633,30 @@ async def _dispatch_action_intent(
 
     # Export
     if action == "export":
-        await export_response(update, context)
+        export_format = action_args.get("format")
+        if export_format in ("pdf", "docx"):
+            last_response = context.user_data.get("last_response")
+            if not last_response:
+                await update.message.reply_text(
+                    "No previous response to export.\nAsk a question first."
+                )
+                return True
+
+            ok = await _send_export_file(
+                context=context,
+                chat_id=update.effective_chat.id,
+                export_format=export_format,
+                question=last_response.get("question", ""),
+                answer=last_response.get("answer", ""),
+                store_name=last_response.get("store", "")
+            )
+
+            if not ok:
+                await update.message.reply_text(
+                    f"Failed to generate {export_format.upper()} export."
+                )
+        else:
+            await export_response(update, context)
         return True
 
     # Sync related (admin)
@@ -1913,32 +1957,15 @@ async def _send_answer(status_msg, update, answer, context, question, store_name
     # Auto-export if requested in the same flow
     export_after = context.user_data.pop("export_after_answer", None)
     if export_after in ("pdf", "docx"):
-        title = question[:50] if question else "Export"
-        if export_after == "pdf":
-            file_path = export_client.export_to_pdf(
-                content=answer,
-                title=title,
-                question=question,
-                store_name=store_name
-            )
-        else:
-            file_path = export_client.export_to_docx(
-                content=answer,
-                title=title,
-                question=question,
-                store_name=store_name
-            )
-
-        if file_path and file_path.exists():
-            with open(file_path, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=f,
-                    filename=file_path.name,
-                    caption=f"Export: {title}"
-                )
-            file_path.unlink(missing_ok=True)
-        else:
+        ok = await _send_export_file(
+            context=context,
+            chat_id=update.effective_chat.id,
+            export_format=export_after,
+            question=question,
+            answer=answer,
+            store_name=store_name
+        )
+        if not ok:
             await update.message.reply_text(
                 f"Failed to generate {export_after.upper()} export."
             )
