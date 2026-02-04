@@ -19,79 +19,9 @@ logger = logging.getLogger(__name__)
 
 ThinkingLevel = Literal["minimal", "low", "medium", "high"]
 
-# Patterns for detecting web search queries
-WEB_SEARCH_PATTERNS = [
-    r"найди в интернете",
-    r"поищи в интернете",
-    r"актуальн(ые|ая|ую) цен",
-    r"текущ(ие|ая|ую) (цен|норм|курс)",
-    r"202[4-9] год",
-    r"на сегодня",
-    r"последн(ие|яя) новости",
-    r"search online",
-    r"search the web",
-    r"current prices?",
-    r"latest news",
-    r"find online",
-]
 
-
-def detect_web_search_query(question: str) -> bool:
-    """
-    Detect if the question requires web search.
-
-    Args:
-        question: User's question
-
-    Returns:
-        True if web search should be used
-    """
-    import re
-    question_lower = question.lower()
-
-    for pattern in WEB_SEARCH_PATTERNS:
-        if re.search(pattern, question_lower):
-            logger.info(f"Detected web search query: pattern='{pattern}'")
-            return True
-
-    return False
-
-
-# Patterns for detecting source citation requests
-SOURCE_REQUEST_PATTERNS = [
-    r"дай источник",
-    r"откуда информация",
-    r"из какого документа",
-    r"покажи ссылк",
-    r"укажи источник",
-    r"какой документ",
-    r"ссылк[аиу] на документ",
-    r"source",
-    r"citation",
-    r"which document",
-    r"show link",
-]
-
-
-def detect_source_request(question: str) -> bool:
-    """
-    Detect if the user is asking for source citation.
-
-    Args:
-        question: User's question
-
-    Returns:
-        True if source citation is requested
-    """
-    import re
-    question_lower = question.lower()
-
-    for pattern in SOURCE_REQUEST_PATTERNS:
-        if re.search(pattern, question_lower):
-            logger.info(f"Detected source request: pattern='{pattern}'")
-            return True
-
-    return False
+# Note: Query type detection is now handled by QueryProcessor with ultrathinking
+# Old pattern-based detection removed in favor of AI-powered understanding
 
 
 class GeminiFileSearchClient:

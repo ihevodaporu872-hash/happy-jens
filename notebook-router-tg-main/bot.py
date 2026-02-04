@@ -42,8 +42,9 @@ from config import (
     MEMORY_MAX_MESSAGES,
     MEMORY_CLEANUP_DAYS,
 )
-from router import NotebookRouter, detect_multistore_query
-from gemini_client import GeminiFileSearchClient, detect_web_search_query, detect_source_request
+from router import NotebookRouter
+from gemini_client import GeminiFileSearchClient
+from query_processor import QueryProcessor
 from google_drive_client import GoogleDriveClient
 from memory_client import UserMemoryClient
 from export_client import ExportClient
@@ -92,6 +93,12 @@ logger.info(f"Memory client initialized (max {MEMORY_MAX_MESSAGES} messages per 
 # Initialize export client
 export_client = ExportClient()
 logger.info("Export client initialized")
+
+# Initialize query processor (ultrathinking for understanding user intent)
+query_processor = None
+if GEMINI_API_KEY:
+    query_processor = QueryProcessor(GEMINI_API_KEY, model=GEMINI_MODEL)
+    logger.info("Query processor initialized with ultrathinking")
 
 
 def check_user_allowed(user_id: int) -> bool:
@@ -724,16 +731,26 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Route and answer the question
+        # Process with ultrathinking
+        processed = query_processor.process_query(
+            question=transcription,
+            available_stores=gemini_client.stores,
+            conversation_context=""
+        )
+
+        # Route to best store
         if router and len(gemini_client.stores) > 1:
-            selected, reasoning = router.route_with_reasoning(transcription, max_notebooks=1)
+            selected, reasoning = router.route_with_reasoning(
+                processed.optimized_prompt,
+                max_notebooks=1
+            )
             store = selected[0] if selected else gemini_client.stores[0]
         else:
             store = gemini_client.stores[0]
 
         answer = gemini_client.ask_question(
             store["id"],
-            transcription,
+            processed.optimized_prompt,  # Use optimized prompt
             model=GEMINI_MODEL
         )
 
@@ -1202,7 +1219,7 @@ async def clear_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle user questions with smart routing, memory, and multistore support"""
+    """Handle user questions with AI-powered understanding and ultrathinking"""
     user_id = update.effective_user.id
 
     if not check_user_allowed(user_id):
@@ -1226,133 +1243,142 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.chat.send_action("typing")
 
-    status_msg = await update.message.reply_text("Analyzing question...")
+    status_msg = await update.message.reply_text("Analyzing your question...")
 
     try:
-        # Check if this requires web search
-        if detect_web_search_query(question):
-            await status_msg.edit_text("Searching the web...")
+        # Get conversation context for better understanding
+        # Use "global" context for cross-store queries
+        conversation_context = memory_client.get_context_prompt(user_id, "global")
 
-            answer = gemini_client.ask_with_web_search(question, model=GEMINI_MODEL)
+        # Process query with ultrathinking to understand intent
+        await status_msg.edit_text("Understanding your request...")
+
+        processed = query_processor.process_query(
+            question=question,
+            available_stores=gemini_client.stores,
+            conversation_context=conversation_context
+        )
+
+        logger.info(f"Query type: {processed.query_type}, intent: {processed.user_intent}, "
+                   f"confidence: {processed.confidence}")
+
+        # Show what AI understood
+        intent_text = f"Понял: {processed.user_intent}" if processed.user_intent else ""
+
+        # Handle different query types
+        if processed.query_type == "web_search":
+            await status_msg.edit_text(f"{intent_text}\n\nSearching the web...")
+
+            answer = gemini_client.ask_with_web_search(
+                processed.optimized_prompt,
+                model=GEMINI_MODEL
+            )
 
             if answer:
-                # Prefix with web search indicator
-                answer = f"[Результат веб-поиска]\n\n{answer}"
-
-                # Save to memory
+                answer = f"[Веб-поиск]\n\n{answer}"
                 memory_client.add_message(user_id, "web", "user", question)
                 memory_client.add_message(user_id, "web", "assistant", answer)
 
-                if len(answer) > 4000:
-                    parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
-                    await status_msg.edit_text(parts[0])
-                    for part in parts[1:]:
-                        await update.message.reply_text(part)
-                else:
-                    await status_msg.edit_text(answer)
+                await _send_answer(status_msg, update, answer, context, question, "web")
             else:
                 await status_msg.edit_text("Не удалось выполнить веб-поиск.")
             return
 
-        # Check if this is a multistore query
-        if len(gemini_client.stores) > 1 and detect_multistore_query(question):
+        if processed.query_type == "multistore":
             await status_msg.edit_text(
-                f"Searching across {len(gemini_client.stores)} stores..."
+                f"{intent_text}\n\nSearching across {len(gemini_client.stores)} stores..."
             )
 
-            # Query all stores in parallel
             store_ids = [s["id"] for s in gemini_client.stores]
             results = gemini_client.ask_multistore_parallel(
-                store_ids, question, model=GEMINI_MODEL
+                store_ids,
+                processed.optimized_prompt,  # Use optimized prompt
+                model=GEMINI_MODEL
             )
 
-            # Format and send response
             answer = gemini_client.format_multistore_response(results)
-
-            # Save to memory with "global" store ID
             memory_client.add_message(user_id, "global", "user", question)
             memory_client.add_message(user_id, "global", "assistant", answer)
 
-            if len(answer) > 4000:
-                parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
-                await status_msg.edit_text(parts[0])
-                for part in parts[1:]:
-                    await update.message.reply_text(part)
-            else:
-                await status_msg.edit_text(answer)
+            await _send_answer(status_msg, update, answer, context, question, "multistore")
             return
 
-        # Regular single-store query
-        # Route the question
+        if processed.query_type == "compare":
+            # Handle comparison
+            if processed.target_stores and len(processed.target_stores) >= 2:
+                store_1 = gemini_client.get_store_by_name(processed.target_stores[0])
+                store_2 = gemini_client.get_store_by_name(processed.target_stores[1])
+
+                if store_1 and store_2:
+                    await status_msg.edit_text(
+                        f"{intent_text}\n\n"
+                        f"Comparing {store_1.get('name')} vs {store_2.get('name')}..."
+                    )
+
+                    result = gemini_client.compare_stores(
+                        store_1["id"],
+                        store_2["id"],
+                        processed.compare_topic or processed.optimized_prompt,
+                        model=GEMINI_MODEL
+                    )
+
+                    if result:
+                        answer = f"Сравнение: {store_1.get('name')} vs {store_2.get('name')}\n\n{result}"
+                        await _send_answer(status_msg, update, answer, context, question, "compare")
+                        return
+
+            # Fallback if comparison failed
+            await status_msg.edit_text("Не удалось определить stores для сравнения.")
+            return
+
+        # Single store query (default)
+        # Route to best store if multiple available
         if router and len(gemini_client.stores) > 1:
-            selected, reasoning = router.route_with_reasoning(question, max_notebooks=1)
+            selected, reasoning = router.route_with_reasoning(
+                processed.optimized_prompt,
+                max_notebooks=1
+            )
             if selected:
                 store = selected[0]
-                await status_msg.edit_text(
-                    f"Selected: {store.get('name')}\n"
-                    f"Reason: {reasoning}\n\n"
-                    f"Getting answer..."
-                )
             else:
                 store = gemini_client.stores[0]
-                await status_msg.edit_text(f"Querying {store.get('name')}...")
         else:
             store = gemini_client.stores[0]
-            await status_msg.edit_text(f"Querying {store.get('name')}...")
 
-        # Get conversation context from memory
-        context_prompt = memory_client.get_context_prompt(user_id, store["id"])
+        await status_msg.edit_text(
+            f"{intent_text}\n\n"
+            f"Querying {store.get('name')}..."
+        )
 
-        # Build question with context
-        if context_prompt:
-            question_with_context = f"{context_prompt}\n{question}"
+        # Get store-specific conversation context
+        store_context = memory_client.get_context_prompt(user_id, store["id"])
+
+        # Build final prompt with context
+        if store_context:
+            final_prompt = f"{store_context}\n{processed.optimized_prompt}"
         else:
-            question_with_context = question
+            final_prompt = processed.optimized_prompt
 
         # Save user message to memory
         memory_client.add_message(user_id, store["id"], "user", question)
 
-        # Check if user wants sources
-        include_sources = detect_source_request(question)
-
-        # Get answer from Gemini
-        if include_sources:
+        # Get answer with or without sources
+        if processed.include_sources:
             answer = gemini_client.ask_with_sources(
                 store["id"],
-                question_with_context,
+                final_prompt,
                 model=GEMINI_MODEL
             )
         else:
             answer = gemini_client.ask_question(
                 store["id"],
-                question_with_context,
+                final_prompt,
                 model=GEMINI_MODEL
             )
 
         if answer:
-            # Save assistant response to memory
             memory_client.add_message(user_id, store["id"], "assistant", answer)
-
-            # Save for export
-            context.user_data["last_response"] = {
-                "question": question,
-                "answer": answer,
-                "store": store.get("name", ""),
-                "timestamp": datetime.now().isoformat()
-            }
-
-            if len(answer) > 4000:
-                parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
-                await status_msg.edit_text(parts[0])
-                for part in parts[1:]:
-                    await update.message.reply_text(part)
-                # Add export buttons to last message
-                await update.message.reply_text(
-                    "Export:",
-                    reply_markup=get_export_keyboard()
-                )
-            else:
-                await status_msg.edit_text(answer, reply_markup=get_export_keyboard())
+            await _send_answer(status_msg, update, answer, context, question, store.get("name", ""))
         else:
             await status_msg.edit_text(
                 "No answer received.\n"
@@ -1362,6 +1388,26 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Error handling question")
         await status_msg.edit_text(f"Error: {str(e)[:500]}")
+
+
+async def _send_answer(status_msg, update, answer, context, question, store_name):
+    """Helper to send answer with export buttons and handle long messages."""
+    # Save for export
+    context.user_data["last_response"] = {
+        "question": question,
+        "answer": answer,
+        "store": store_name,
+        "timestamp": datetime.now().isoformat()
+    }
+
+    if len(answer) > 4000:
+        parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
+        await status_msg.edit_text(parts[0])
+        for part in parts[1:]:
+            await update.message.reply_text(part)
+        await update.message.reply_text("Export:", reply_markup=get_export_keyboard())
+    else:
+        await status_msg.edit_text(answer, reply_markup=get_export_keyboard())
 
 
 async def memory_cleanup_job(context: ContextTypes.DEFAULT_TYPE):
