@@ -152,6 +152,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/syncnow - Force sync now (admin)\n\n"
         "Send:\n"
         "- Text message to query stores\n"
+        "- Google Drive folder link to auto-create store (admin)\n"
         "- Photo to analyze (add caption for custom prompt)\n"
         "- Voice message to ask questions\n\n"
         "Bot remembers last 5 messages per store for context.\n"
@@ -1228,6 +1229,127 @@ async def clear_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_folder_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Google Drive folder link - auto-create store with AI-generated name"""
+    user_id = update.effective_user.id
+    message_text = update.message.text.strip()
+
+    # Extract folder URL
+    urls = GoogleDriveClient.extract_all_urls(message_text)
+    folder_urls = [(url, fid, ftype) for url, fid, ftype in urls if ftype == 'folder']
+
+    if not folder_urls:
+        return False  # Not a folder link
+
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "Only admin can create stores from folder links."
+        )
+        return True
+
+    url, folder_id, _ = folder_urls[0]
+
+    await update.message.chat.send_action("typing")
+    status_msg = await update.message.reply_text(
+        "Detected Google Drive folder.\n"
+        "Creating new tender store..."
+    )
+
+    # Create temporary store
+    import uuid
+    temp_name = f"Tender_{uuid.uuid4().hex[:8]}"
+
+    await status_msg.edit_text(f"Creating store '{temp_name}'...")
+
+    result = gemini_client.create_store(temp_name, "Analyzing...")
+    if not result:
+        await status_msg.edit_text("Failed to create store. Check logs.")
+        return True
+
+    store_id = result["id"]
+
+    # Download and upload files from folder
+    if not drive_client or not drive_client.is_configured():
+        await status_msg.edit_text(
+            "Google Drive Service Account required for folder access.\n"
+            "Configure service_account.json"
+        )
+        return True
+
+    await status_msg.edit_text("Downloading files from folder...")
+
+    import tempfile
+    temp_dir = Path(tempfile.mkdtemp(prefix="folder_"))
+
+    try:
+        downloaded = drive_client.download_folder(folder_id, temp_dir)
+
+        if not downloaded:
+            await status_msg.edit_text("No files found in folder or access denied.")
+            gemini_client.delete_store(store_id)
+            return True
+
+        await status_msg.edit_text(f"Uploading {len(downloaded)} files...")
+
+        success_count = 0
+        for file_path, file_name in downloaded:
+            if gemini_client.upload_file(store_id, file_path, file_name, source_url=url):
+                success_count += 1
+            file_path.unlink(missing_ok=True)
+
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if success_count == 0:
+            await status_msg.edit_text("Failed to upload files.")
+            gemini_client.delete_store(store_id)
+            return True
+
+        # Analyze content with Gemini Pro to get name and description
+        await status_msg.edit_text(
+            f"Uploaded {success_count} files.\n"
+            "Analyzing content to determine tender name..."
+        )
+
+        analysis = gemini_client.analyze_store_content(store_id, model=GEMINI_MODEL_PRO)
+
+        if analysis:
+            tender_name = analysis.get("name", temp_name)
+            tender_desc = analysis.get("description", "")
+
+            gemini_client.update_store_metadata(store_id, tender_name, tender_desc)
+
+            if router:
+                router.reload_library()
+
+            await status_msg.edit_text(
+                f"Store created!\n\n"
+                f"Name: {tender_name}\n"
+                f"Description: {tender_desc}\n"
+                f"Documents: {success_count}\n\n"
+                f"You can now ask questions about this tender."
+            )
+        else:
+            if router:
+                router.reload_library()
+
+            await status_msg.edit_text(
+                f"Store created!\n\n"
+                f"Name: {temp_name}\n"
+                f"Documents: {success_count}\n\n"
+                f"Could not auto-detect tender name.\n"
+                f"You can rename with /rename command."
+            )
+
+    except Exception as e:
+        logger.exception("Error processing folder")
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        await status_msg.edit_text(f"Error: {str(e)[:300]}")
+
+    return True
+
+
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle user questions with AI-powered understanding and ultrathinking"""
     user_id = update.effective_user.id
@@ -1239,6 +1361,12 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = update.message.text.strip()
     if not question:
         return
+
+    # Check if this is a Google Drive folder link (admin only)
+    if "drive.google.com" in question and "folders" in question:
+        handled = await handle_folder_link(update, context)
+        if handled:
+            return
 
     if not gemini_client:
         await update.message.reply_text("Gemini API not configured.")

@@ -606,6 +606,96 @@ class GeminiFileSearchClient:
 
         return "\n".join(lines)
 
+    def analyze_store_content(
+        self,
+        store_id: str,
+        model: str = "gemini-3-pro-preview"
+    ) -> Optional[Dict]:
+        """
+        Analyze store content to generate name and description.
+        Uses Gemini Pro to understand documents and create summary.
+
+        Args:
+            store_id: Store resource name
+            model: Gemini model (Pro recommended for analysis)
+
+        Returns:
+            Dict with 'name' and 'description' or None on failure
+        """
+        try:
+            analysis_prompt = """Проанализируй документы в этой базе знаний и определи:
+
+1. НАЗВАНИЕ ТЕНДЕРА/ПРОЕКТА - краткое официальное название (например: "ЖК Солнечный - Благоустройство", "Метро Кунцевская - Водопонижение")
+
+2. КРАТКОЕ ОПИСАНИЕ - 2-3 предложения о сути проекта:
+   - Что за объект
+   - Какие основные работы
+   - Ключевые особенности
+
+Ответь СТРОГО в формате JSON:
+{
+    "name": "Краткое название тендера",
+    "description": "Краткое описание проекта и основных работ"
+}
+
+Анализируй только факты из документов. JSON:"""
+
+            response = self.client.models.generate_content(
+                model=model,
+                contents=analysis_prompt,
+                config=types.GenerateContentConfig(
+                    tools=[
+                        types.Tool(
+                            file_search=types.FileSearch(
+                                file_search_store_names=[store_id]
+                            )
+                        )
+                    ],
+                    temperature=0.1,
+                    max_output_tokens=500
+                )
+            )
+
+            if not response or not response.text:
+                return None
+
+            # Parse JSON
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', response.text)
+            if json_match:
+                data = json.loads(json_match.group())
+                logger.info(f"Analyzed store: name='{data.get('name')}', desc='{data.get('description', '')[:50]}...'")
+                return data
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Store analysis failed: {e}")
+            return None
+
+    def update_store_metadata(self, store_id: str, name: str = None, description: str = None) -> bool:
+        """
+        Update store name and description in local metadata.
+
+        Args:
+            store_id: Store resource name
+            name: New name (optional)
+            description: New description (optional)
+
+        Returns:
+            True if updated
+        """
+        for store in self.stores:
+            if store["id"] == store_id:
+                if name:
+                    store["name"] = name
+                if description:
+                    store["description"] = description
+                self._save_stores()
+                logger.info(f"Updated store metadata: {name}")
+                return True
+        return False
+
     def ask_with_web_search(
         self,
         question: str,
