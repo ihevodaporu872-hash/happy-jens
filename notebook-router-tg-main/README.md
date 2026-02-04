@@ -1,54 +1,28 @@
-# NotebookLM Telegram Bot
+# Tender Document Telegram Bot (Gemini)
 
-Telegram бот для запросов к Google NotebookLM. Отправляйте вопросы в Telegram — получайте ответы из ваших документов.
+Telegram бот для работы с тендерной документацией через Gemini.
+Каждый **store** = отдельный тендер с загруженными документами (PDF, DOCX и т.д.).
 
 ## Требования
 
-- Python 3.8+
-- Настроенный [notebooklm-skill](https://github.com/PleasePrompto/notebooklm-skill) с авторизацией
-- Telegram Bot Token от [@BotFather](https://t.me/BotFather)
+- Python 3.10+
+- Telegram Bot Token от @BotFather
+- Gemini API Key (Google AI Studio)
+- (Опционально) Google Drive Service Account для доступа к папкам
 
 ## Установка
 
 ```bash
-# 1. Клонируйте репозиторий
-git clone https://github.com/PleasePrompto/notebooklm-telegram-bot
-cd notebooklm-telegram-bot
-
-# 2. Создайте виртуальное окружение
 python -m venv .venv
 .venv\Scripts\activate  # Windows
 # source .venv/bin/activate  # Linux/Mac
 
-# 3. Установите зависимости
 pip install -r requirements.txt
-
-# 4. Создайте .env файл
 copy .env.example .env  # Windows
 # cp .env.example .env  # Linux/Mac
-
-# 5. Отредактируйте .env - добавьте BOT_TOKEN
 ```
 
-## Настройка
-
-### Получение Bot Token
-
-1. Откройте [@BotFather](https://t.me/BotFather) в Telegram
-2. Отправьте `/newbot`
-3. Следуйте инструкциям
-4. Скопируйте токен в `.env`
-
-### Настройка notebooklm-skill
-
-Убедитесь, что [notebooklm-skill](https://github.com/PleasePrompto/notebooklm-skill) настроен:
-
-```bash
-cd ../notebooklm-skill
-.venv\Scripts\python scripts\auth_manager.py status
-```
-
-Если не авторизован — запустите `auth_manager.py setup`.
+Заполни `.env` как минимум `BOT_TOKEN` и `GEMINI_API_KEY`.
 
 ## Запуск
 
@@ -56,48 +30,44 @@ cd ../notebooklm-skill
 python bot.py
 ```
 
-## Команды бота
+## Команды
 
 | Команда | Описание |
 |---------|----------|
-| `/start` | Приветствие и справка |
-| `/set <url>` | Установить активный блокнот |
-| `/list` | Показать сохранённые блокноты |
-| `/status` | Проверить статус авторизации |
-| *любой текст* | Запрос к NotebookLM |
+| `/start`, `/help` | Приветствие и справка |
+| `/list`, `/stores` | Список всех stores |
+| `/select <store>` | Выбрать активный store |
+| `/status` | Статус и конфигурация |
+| `/clear` | Очистить историю диалога |
+| `/compare <s1> <s2> <topic>` | Сравнить два тендера |
+| `/export` | Экспорт последнего ответа в PDF/DOCX |
+| `/add`, `/addstore` | Создать store (админ) |
+| `/delete`, `/deletestore` | Удалить store (админ) |
+| `/rename <old> | <new>` | Переименовать store (админ) |
+| `/upload` | Загрузить файл в store (админ) |
+| `/uploadurl` | Загрузить из Google URL (админ) |
+| `/setsync` | Настроить автосинк (админ) |
+| `/syncnow` | Принудительный синк (админ) |
 
-## Пример использования
+## Натуральный язык (без команд)
 
-```
-Вы: /set https://notebooklm.google.com/notebook/abc123
-Бот: Notebook set!
-
-Вы: Какие требования к API авторизации?
-Бот: Согласно документации, API требует OAuth 2.0...
-```
-
-## Безопасность
-
-Для ограничения доступа добавьте в `.env`:
-
-```
-ALLOWED_USERS=123456789,987654321
-```
-
-Узнать свой Telegram ID можно через [@userinfobot](https://t.me/userinfobot).
+Бот понимает запросы вида:
+- "Покажи список тендеров"
+- "Выбери тендер Дубровка"
+- "Сделай экспорт в PDF"
+- "Сравни Дубровка и МайПриорити по земляным работам"
 
 ## Структура проекта
 
 ```
-notebooklm-telegram-bot/
+notebook-router-tg-main/
 ├── bot.py              # Основной код бота
 ├── config.py           # Конфигурация
-├── requirements.txt    # Зависимости
-├── .env.example        # Пример настроек
-└── .gitignore
+├── gemini_client.py    # Gemini File Search
+├── query_processor.py  # AI понимание запросов
+├── router.py           # Роутинг по stores
+├── memory_client.py    # Память пользователя
+├── export_client.py    # Экспорт PDF/DOCX
+├── google_drive_client.py # Загрузка из Google Drive
+└── requirements.txt
 ```
-
-## Связанные проекты
-
-- [notebooklm-skill](https://github.com/PleasePrompto/notebooklm-skill) — Claude Code Skill для NotebookLM
-- [notebooklm-mcp](https://github.com/PleasePrompto/notebooklm-mcp) — MCP сервер для NotebookLM
