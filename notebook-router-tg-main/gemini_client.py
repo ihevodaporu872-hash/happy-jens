@@ -8,6 +8,7 @@ Uses thinking_level for reasoning control.
 import json
 import logging
 import time
+import concurrent.futures
 from pathlib import Path
 from typing import Optional, List, Dict, Literal
 
@@ -17,6 +18,80 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 ThinkingLevel = Literal["minimal", "low", "medium", "high"]
+
+# Patterns for detecting web search queries
+WEB_SEARCH_PATTERNS = [
+    r"найди в интернете",
+    r"поищи в интернете",
+    r"актуальн(ые|ая|ую) цен",
+    r"текущ(ие|ая|ую) (цен|норм|курс)",
+    r"202[4-9] год",
+    r"на сегодня",
+    r"последн(ие|яя) новости",
+    r"search online",
+    r"search the web",
+    r"current prices?",
+    r"latest news",
+    r"find online",
+]
+
+
+def detect_web_search_query(question: str) -> bool:
+    """
+    Detect if the question requires web search.
+
+    Args:
+        question: User's question
+
+    Returns:
+        True if web search should be used
+    """
+    import re
+    question_lower = question.lower()
+
+    for pattern in WEB_SEARCH_PATTERNS:
+        if re.search(pattern, question_lower):
+            logger.info(f"Detected web search query: pattern='{pattern}'")
+            return True
+
+    return False
+
+
+# Patterns for detecting source citation requests
+SOURCE_REQUEST_PATTERNS = [
+    r"дай источник",
+    r"откуда информация",
+    r"из какого документа",
+    r"покажи ссылк",
+    r"укажи источник",
+    r"какой документ",
+    r"ссылк[аиу] на документ",
+    r"source",
+    r"citation",
+    r"which document",
+    r"show link",
+]
+
+
+def detect_source_request(question: str) -> bool:
+    """
+    Detect if the user is asking for source citation.
+
+    Args:
+        question: User's question
+
+    Returns:
+        True if source citation is requested
+    """
+    import re
+    question_lower = question.lower()
+
+    for pattern in SOURCE_REQUEST_PATTERNS:
+        if re.search(pattern, question_lower):
+            logger.info(f"Detected source request: pattern='{pattern}'")
+            return True
+
+    return False
 
 
 class GeminiFileSearchClient:
@@ -105,6 +180,7 @@ class GeminiFileSearchClient:
         store_id: str,
         file_path: Path,
         display_name: str = "",
+        source_url: str = "",
         wait: bool = True,
         timeout: int = 300
     ) -> bool:
@@ -115,6 +191,7 @@ class GeminiFileSearchClient:
             store_id: Store resource name
             file_path: Path to file to upload
             display_name: Display name for the file
+            source_url: Source URL (Google Docs/Drive link)
             wait: Wait for processing to complete
             timeout: Max seconds to wait
 
@@ -122,6 +199,8 @@ class GeminiFileSearchClient:
             True if successful
         """
         try:
+            from datetime import datetime
+
             if not display_name:
                 display_name = file_path.name
 
@@ -142,10 +221,14 @@ class GeminiFileSearchClient:
 
             for store in self.stores:
                 if store["id"] == store_id:
-                    store["documents"].append({
+                    doc_entry = {
                         "name": display_name,
-                        "path": str(file_path)
-                    })
+                        "path": str(file_path),
+                        "uploaded_at": datetime.now().isoformat()
+                    }
+                    if source_url:
+                        doc_entry["source_url"] = source_url
+                    store["documents"].append(doc_entry)
                     break
             self._save_stores()
 
@@ -265,6 +348,112 @@ class GeminiFileSearchClient:
             logger.error(f"Failed to get thinking answer: {e}")
             return None, None
 
+    def analyze_image(
+        self,
+        image_path: Path,
+        prompt: str = "Опиши что на изображении",
+        model: str = "gemini-3-flash-preview"
+    ) -> Optional[str]:
+        """
+        Analyze an image using Gemini Vision API.
+
+        Args:
+            image_path: Path to image file
+            prompt: Prompt for analysis
+            model: Gemini model to use
+
+        Returns:
+            Analysis text or None on failure
+        """
+        try:
+            # Read image file
+            with open(image_path, "rb") as f:
+                image_data = f.read()
+
+            # Determine MIME type
+            suffix = image_path.suffix.lower()
+            mime_types = {
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".png": "image/png",
+                ".gif": "image/gif",
+                ".webp": "image/webp",
+            }
+            mime_type = mime_types.get(suffix, "image/jpeg")
+
+            # Create image part
+            image_part = types.Part.from_bytes(data=image_data, mime_type=mime_type)
+
+            # Send to Gemini
+            response = self.client.models.generate_content(
+                model=model,
+                contents=[prompt, image_part]
+            )
+
+            if response and response.text:
+                logger.info(f"Analyzed image: {image_path.name}")
+                return response.text
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to analyze image: {e}")
+            return None
+
+    def transcribe_voice(
+        self,
+        audio_path: Path,
+        model: str = "gemini-3-flash-preview"
+    ) -> Optional[str]:
+        """
+        Transcribe voice message using Gemini API.
+
+        Args:
+            audio_path: Path to audio file (OGG format from Telegram)
+            model: Gemini model to use
+
+        Returns:
+            Transcribed text or None on failure
+        """
+        try:
+            # Read audio file
+            with open(audio_path, "rb") as f:
+                audio_data = f.read()
+
+            # Determine MIME type
+            suffix = audio_path.suffix.lower()
+            mime_types = {
+                ".ogg": "audio/ogg",
+                ".oga": "audio/ogg",
+                ".mp3": "audio/mpeg",
+                ".wav": "audio/wav",
+                ".m4a": "audio/mp4",
+            }
+            mime_type = mime_types.get(suffix, "audio/ogg")
+
+            # Create audio part
+            audio_part = types.Part.from_bytes(data=audio_data, mime_type=mime_type)
+
+            # Send to Gemini with transcription prompt
+            response = self.client.models.generate_content(
+                model=model,
+                contents=[
+                    "Расшифруй это голосовое сообщение на русском языке. "
+                    "Верни только текст сообщения без дополнительных комментариев.",
+                    audio_part
+                ]
+            )
+
+            if response and response.text:
+                logger.info(f"Transcribed voice: {audio_path.name}")
+                return response.text.strip()
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to transcribe voice: {e}")
+            return None
+
     def get_store_by_name(self, name: str) -> Optional[Dict]:
         """Find store by display name."""
         name_lower = name.lower()
@@ -323,7 +512,10 @@ class GeminiFileSearchClient:
                         "id": api_store.name,
                         "name": api_store.display_name or "Unnamed",
                         "description": "",
-                        "documents": []
+                        "documents": [],
+                        "sync_urls": [],
+                        "last_sync": None,
+                        "auto_sync_enabled": False
                     })
 
             self._save_stores()
@@ -331,6 +523,335 @@ class GeminiFileSearchClient:
 
         except Exception as e:
             logger.error(f"Failed to sync stores: {e}")
+
+    def set_sync_urls(self, store_id: str, urls: List[str], auto_sync: bool = True) -> bool:
+        """
+        Set URLs for automatic synchronization of a store.
+
+        Args:
+            store_id: Store resource name
+            urls: List of Google Drive/Docs URLs
+            auto_sync: Enable automatic sync
+
+        Returns:
+            True if successful
+        """
+        for store in self.stores:
+            if store["id"] == store_id:
+                store["sync_urls"] = urls
+                store["auto_sync_enabled"] = auto_sync
+                self._save_stores()
+                logger.info(f"Set sync URLs for {store.get('name')}: {len(urls)} URLs")
+                return True
+        return False
+
+    def get_stores_for_sync(self) -> List[Dict]:
+        """
+        Get stores that need synchronization.
+
+        Returns:
+            List of stores with auto_sync_enabled=True and sync_urls set
+        """
+        return [
+            store for store in self.stores
+            if store.get("auto_sync_enabled") and store.get("sync_urls")
+        ]
+
+    def update_last_sync(self, store_id: str):
+        """Update last_sync timestamp for a store."""
+        from datetime import datetime
+        for store in self.stores:
+            if store["id"] == store_id:
+                store["last_sync"] = datetime.now().isoformat()
+                self._save_stores()
+                break
+
+    def ask_multistore_parallel(
+        self,
+        store_ids: List[str],
+        question: str,
+        model: str = "gemini-3-flash-preview",
+        max_workers: int = 5
+    ) -> List[Dict]:
+        """
+        Ask the same question to multiple stores in parallel.
+
+        Args:
+            store_ids: List of store resource names
+            question: User's question
+            model: Gemini model to use
+            max_workers: Maximum parallel requests
+
+        Returns:
+            List of dicts with store_id, store_name, answer, has_result
+        """
+        results = []
+
+        def query_store(store_id: str) -> Dict:
+            store = self.get_store_by_id(store_id)
+            store_name = store.get("name", "Unknown") if store else "Unknown"
+
+            try:
+                # Ask for a brief answer with key quote
+                enhanced_question = (
+                    f"{question}\n\n"
+                    "Ответь кратко (1-2 предложения) и приведи ключевую цитату из документа, "
+                    "если информация найдена. Если информация не найдена, скажи 'Не найдено'."
+                )
+
+                answer = self.ask_question(store_id, enhanced_question, model=model)
+
+                if answer:
+                    # Check if answer indicates no results
+                    no_result_indicators = [
+                        "не найден", "не содержит", "нет информации",
+                        "отсутствует", "not found", "no information"
+                    ]
+                    has_result = not any(
+                        ind in answer.lower() for ind in no_result_indicators
+                    )
+                else:
+                    has_result = False
+                    answer = "Ошибка запроса"
+
+                return {
+                    "store_id": store_id,
+                    "store_name": store_name,
+                    "answer": answer,
+                    "has_result": has_result
+                }
+
+            except Exception as e:
+                logger.error(f"Multistore query error for {store_id}: {e}")
+                return {
+                    "store_id": store_id,
+                    "store_name": store_name,
+                    "answer": f"Ошибка: {str(e)[:100]}",
+                    "has_result": False
+                }
+
+        # Execute queries in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_store = {
+                executor.submit(query_store, store_id): store_id
+                for store_id in store_ids
+            }
+
+            for future in concurrent.futures.as_completed(future_to_store):
+                result = future.result()
+                results.append(result)
+
+        # Sort results: stores with results first
+        results.sort(key=lambda x: (not x["has_result"], x["store_name"]))
+
+        logger.info(f"Multistore query complete: {len(results)} stores, "
+                   f"{sum(1 for r in results if r['has_result'])} with results")
+
+        return results
+
+    def format_multistore_response(self, results: List[Dict]) -> str:
+        """
+        Format multistore query results for display.
+
+        Args:
+            results: Results from ask_multistore_parallel
+
+        Returns:
+            Formatted string for Telegram message
+        """
+        results_with_data = [r for r in results if r["has_result"]]
+
+        if not results_with_data:
+            return "Информация не найдена ни в одном из тендеров."
+
+        lines = [f"Найдено в {len(results_with_data)} тендерах:\n"]
+
+        for i, result in enumerate(results_with_data, 1):
+            lines.append(f"{i}. **{result['store_name']}**")
+            # Truncate long answers
+            answer = result["answer"]
+            if len(answer) > 500:
+                answer = answer[:500] + "..."
+            lines.append(f"   {answer}\n")
+
+        return "\n".join(lines)
+
+    def ask_with_web_search(
+        self,
+        question: str,
+        model: str = "gemini-3-flash-preview"
+    ) -> Optional[str]:
+        """
+        Ask a question using Gemini with Google Search grounding.
+
+        Args:
+            question: User's question
+            model: Gemini model to use
+
+        Returns:
+            Answer text with web search results or None on failure
+        """
+        try:
+            response = self.client.models.generate_content(
+                model=model,
+                contents=question,
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())]
+                )
+            )
+
+            if response and response.text:
+                logger.info(f"Got web search answer for: {question[:50]}...")
+                return response.text
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Web search failed: {e}")
+            return None
+
+    def get_store_sources(self, store_id: str) -> List[Dict]:
+        """
+        Get list of documents with source URLs for a store.
+
+        Args:
+            store_id: Store resource name
+
+        Returns:
+            List of dicts with name and source_url
+        """
+        store = self.get_store_by_id(store_id)
+        if not store:
+            return []
+
+        sources = []
+        for doc in store.get("documents", []):
+            if doc.get("source_url"):
+                sources.append({
+                    "name": doc.get("name", "Unknown"),
+                    "source_url": doc.get("source_url")
+                })
+        return sources
+
+    def format_sources_footer(self, store_id: str) -> str:
+        """
+        Format sources as footer text for answer.
+
+        Args:
+            store_id: Store resource name
+
+        Returns:
+            Formatted sources text or empty string
+        """
+        sources = self.get_store_sources(store_id)
+        if not sources:
+            return ""
+
+        lines = ["\n\nИсточники:"]
+        for src in sources[:5]:  # Limit to 5 sources
+            lines.append(f"- {src['name']}: {src['source_url']}")
+
+        return "\n".join(lines)
+
+    def ask_with_sources(
+        self,
+        store_id: str,
+        question: str,
+        model: str = "gemini-3-flash-preview",
+        thinking_level: Optional[ThinkingLevel] = None
+    ) -> Optional[str]:
+        """
+        Ask a question and append source links if available.
+
+        Args:
+            store_id: Store resource name
+            question: User's question
+            model: Gemini model to use
+            thinking_level: Thinking level
+
+        Returns:
+            Answer text with sources or None
+        """
+        answer = self.ask_question(store_id, question, model, thinking_level)
+        if not answer:
+            return None
+
+        sources_footer = self.format_sources_footer(store_id)
+        return answer + sources_footer
+
+    def compare_stores(
+        self,
+        store_id_1: str,
+        store_id_2: str,
+        topic: str,
+        model: str = "gemini-3-flash-preview"
+    ) -> Optional[str]:
+        """
+        Compare information about a topic between two stores.
+
+        Args:
+            store_id_1: First store resource name
+            store_id_2: Second store resource name
+            topic: Topic to compare
+            model: Gemini model to use
+
+        Returns:
+            Comparison text or None on failure
+        """
+        store_1 = self.get_store_by_id(store_id_1)
+        store_2 = self.get_store_by_id(store_id_2)
+
+        name_1 = store_1.get("name", "Store 1") if store_1 else "Store 1"
+        name_2 = store_2.get("name", "Store 2") if store_2 else "Store 2"
+
+        # Query each store for information about the topic
+        query = f"Подробно опиши информацию о теме: {topic}. Приведи конкретные данные, цифры, требования из документов."
+
+        result_1 = self.ask_question(store_id_1, query, model)
+        result_2 = self.ask_question(store_id_2, query, model)
+
+        if not result_1 and not result_2:
+            return f"Информация по теме '{topic}' не найдена ни в одном из тендеров."
+
+        # Build comparison prompt
+        comparison_prompt = f"""Сравни информацию по теме "{topic}" из двух тендеров.
+
+**{name_1}:**
+{result_1 or "Информация не найдена"}
+
+**{name_2}:**
+{result_2 or "Информация не найдена"}
+
+Задача:
+1. Сначала кратко опиши что содержит каждый тендер по этой теме
+2. Выдели РАЗЛИЧИЯ между тендерами (разные требования, объемы, подходы)
+3. Выдели СХОДСТВА (общие требования, одинаковые подходы)
+4. Сделай краткий вывод
+
+Ответ структурируй с заголовками."""
+
+        try:
+            response = self.client.models.generate_content(
+                model=model,
+                contents=comparison_prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.3,
+                    max_output_tokens=2000,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="medium"
+                    )
+                )
+            )
+
+            if response and response.text:
+                logger.info(f"Generated comparison for topic: {topic}")
+                return response.text
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Compare failed: {e}")
+            return None
 
 
 # CLI for testing

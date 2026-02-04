@@ -7,5 +7,17 @@ python-telegram-bot[job-queue]>=21.0
 # Google Gemini API for everything
 google-genai>=1.0.0
 
+# Google Drive API for URL uploads (Service Account)
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.1.0
+google-auth-oauthlib>=1.0.0
+
+# HTTP requests for public Google URLs (no auth)
+requests>=2.28.0
+
 # Environment variables
 python-dotenv>=1.0.0
+
+# Export functionality (PDF/DOCX)
+reportlab>=4.0.0
+python-docx>=0.8.11

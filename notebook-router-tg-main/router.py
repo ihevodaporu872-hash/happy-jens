@@ -7,6 +7,7 @@ Routes questions to the most relevant knowledge stores.
 
 import json
 import logging
+import re
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 
@@ -14,6 +15,41 @@ from google import genai
 from google.genai import types
 
 logger = logging.getLogger(__name__)
+
+# Patterns for detecting multi-store queries
+MULTISTORE_PATTERNS = [
+    r"в каких тендерах",
+    r"во всех (тендерах|проектах|stores?)",
+    r"по всем (тендерам|проектам|stores?)",
+    r"где есть",
+    r"найди во всех",
+    r"в каких (проектах|stores?)",
+    r"сравни (все|тендеры|проекты)",
+    r"across all",
+    r"in all (stores?|projects?|tenders?)",
+    r"find in all",
+    r"search all",
+]
+
+
+def detect_multistore_query(question: str) -> bool:
+    """
+    Detect if the question is asking about multiple stores.
+
+    Args:
+        question: User's question
+
+    Returns:
+        True if the question should search all stores
+    """
+    question_lower = question.lower()
+
+    for pattern in MULTISTORE_PATTERNS:
+        if re.search(pattern, question_lower):
+            logger.info(f"Detected multistore query: pattern='{pattern}'")
+            return True
+
+    return False
 
 
 class NotebookRouter:

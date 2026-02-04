@@ -15,11 +15,14 @@ import sys
 import re
 from pathlib import Path
 
-from telegram import Update
+from datetime import time, datetime
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -33,9 +36,17 @@ from config import (
     STORES_FILE,
     GEMINI_MODEL,
     GEMINI_THINKING_LEVEL,
+    GOOGLE_SERVICE_ACCOUNT_FILE,
+    IMAGE_DEFAULT_PROMPT,
+    MEMORY_FILE,
+    MEMORY_MAX_MESSAGES,
+    MEMORY_CLEANUP_DAYS,
 )
-from router import NotebookRouter
-from gemini_client import GeminiFileSearchClient
+from router import NotebookRouter, detect_multistore_query
+from gemini_client import GeminiFileSearchClient, detect_web_search_query, detect_source_request
+from google_drive_client import GoogleDriveClient
+from memory_client import UserMemoryClient
+from export_client import ExportClient
 
 # Setup logging
 logging.basicConfig(
@@ -59,6 +70,28 @@ if GEMINI_API_KEY and gemini_client:
     logger.info("Smart routing enabled with Gemini")
 else:
     logger.warning("Router not initialized (missing API key)")
+
+# Initialize Google Drive client
+# Will work with Service Account for full access, or without for public URLs only
+drive_client = None
+if Path(GOOGLE_SERVICE_ACCOUNT_FILE).exists():
+    drive_client = GoogleDriveClient(GOOGLE_SERVICE_ACCOUNT_FILE)
+    if drive_client.is_configured():
+        logger.info("Google Drive client initialized with Service Account")
+    else:
+        logger.warning("Google Drive Service Account failed, will use public URLs only")
+else:
+    # Create client without Service Account - will use public URLs only
+    drive_client = GoogleDriveClient(GOOGLE_SERVICE_ACCOUNT_FILE)
+    logger.info("Google Drive client initialized (public URLs only, no Service Account)")
+
+# Initialize memory client
+memory_client = UserMemoryClient(MEMORY_FILE, max_messages=MEMORY_MAX_MESSAGES)
+logger.info(f"Memory client initialized (max {MEMORY_MAX_MESSAGES} messages per context)")
+
+# Initialize export client
+export_client = ExportClient()
+logger.info("Export client initialized")
 
 
 def check_user_allowed(user_id: int) -> bool:
@@ -84,19 +117,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_note = " (you are admin)" if is_admin(update.effective_user.id) else ""
     stores_count = len(gemini_client.stores) if gemini_client else 0
 
+    if drive_client and drive_client.is_configured():
+        drive_status = "enabled (Service Account)"
+    else:
+        drive_status = "enabled (public URLs only)"
+
     await update.message.reply_text(
         f"Gemini 3 Flash Bot{admin_note}\n\n"
         f"Model: {GEMINI_MODEL}\n"
         f"File Search: {gemini_status}\n"
         f"Smart routing: {routing_status}\n"
+        f"Google Drive: {drive_status}\n"
         f"Stores: {stores_count}\n\n"
         "Commands:\n"
         "/list - Show all stores\n"
         "/status - Check status\n"
         "/think <question> - Deep thinking mode\n"
+        "/clear - Clear conversation history\n"
+        "/compare <s1> <s2> <topic> - Compare stores\n"
+        "/export - Export last answer to PDF/DOCX\n"
         "/add - Add new store (admin)\n"
-        "/upload - Upload file (admin)\n\n"
-        "Just send a message to query!"
+        "/upload - Upload file (admin)\n"
+        "/uploadurl - Upload from Google URL (admin)\n"
+        "/setsync - Configure auto-sync URLs (admin)\n"
+        "/syncnow - Force sync now (admin)\n\n"
+        "Send:\n"
+        "- Text message to query stores\n"
+        "- Photo to analyze (add caption for custom prompt)\n"
+        "- Voice message to ask questions\n\n"
+        "Bot remembers last 5 messages per store for context.\n"
+        "Use PDF/DOCX buttons under answers to export."
     )
 
 
@@ -248,6 +298,158 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await upload_file(update, context)
 
 
+async def upload_from_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /uploadurl command - upload files from Google URLs (admin only)"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not is_admin(user_id):
+        await update.message.reply_text("Only admin can upload files.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    # drive_client is always initialized now (with or without Service Account)
+
+    # Parse: /uploadurl <store_name> <url1> [url2] ...
+    message_text = update.message.text
+    args_text = re.sub(r'^/uploadurl\s*', '', message_text, flags=re.IGNORECASE).strip()
+
+    if not args_text:
+        sa_note = ""
+        if not drive_client.is_configured():
+            sa_note = "\n\nNote: No Service Account configured.\nOnly public files (\"Anyone with the link\") will work.\nFolders require Service Account."
+
+        await update.message.reply_text(
+            "Usage: /uploadurl <store_name> <url1> [url2] ...\n\n"
+            "Supported URLs:\n"
+            "- Google Docs (exports as PDF)\n"
+            "- Google Sheets (exports as XLSX)\n"
+            "- Google Slides (exports as PDF)\n"
+            "- Google Drive files\n"
+            "- Google Drive folders (all files, requires Service Account)\n\n"
+            "Example:\n"
+            "/uploadurl MyStore https://docs.google.com/document/d/xxx/edit\n\n"
+            f"Limits: max 10 URLs, max 50 files per folder{sa_note}"
+        )
+        return
+
+    # Extract store name (first word) and URLs
+    parts = args_text.split(None, 1)
+    store_name = parts[0]
+    urls_text = parts[1] if len(parts) > 1 else ""
+
+    store = gemini_client.get_store_by_name(store_name)
+    if not store:
+        await update.message.reply_text(f"Store not found: {store_name}")
+        return
+
+    # Extract all Google URLs from the message
+    urls = GoogleDriveClient.extract_all_urls(urls_text)
+    if not urls:
+        await update.message.reply_text(
+            "No valid Google URLs found.\n"
+            "Supported: docs.google.com, drive.google.com"
+        )
+        return
+
+    status_msg = await update.message.reply_text(
+        f"Found {len(urls)} URL(s). Processing..."
+    )
+
+    # Create temp directory
+    import tempfile
+    temp_dir = Path(tempfile.mkdtemp(prefix="gdrive_"))
+
+    success_count = 0
+    error_count = 0
+    results = []
+
+    try:
+        for i, (url, file_id, file_type) in enumerate(urls):
+            await status_msg.edit_text(
+                f"Processing {i+1}/{len(urls)}: {file_type}..."
+            )
+
+            try:
+                if file_type == 'folder':
+                    # Folders require Service Account
+                    if not drive_client.is_configured():
+                        error_count += 1
+                        results.append(f"- folder {file_id[:20]}... (requires Service Account)")
+                        continue
+
+                    # Download all files from folder
+                    downloaded = drive_client.download_folder(file_id, temp_dir)
+                    for file_path, file_name in downloaded:
+                        success = gemini_client.upload_file(
+                            store["id"],
+                            file_path,
+                            file_name
+                        )
+                        if success:
+                            success_count += 1
+                            results.append(f"+ {file_name}")
+                        else:
+                            error_count += 1
+                            results.append(f"- {file_name} (upload failed)")
+                        file_path.unlink(missing_ok=True)
+                else:
+                    # Download single file (pass file_type for public URL fallback)
+                    file_path = drive_client.download_file(file_id, temp_dir, file_type=file_type)
+                    if file_path:
+                        file_name = file_path.name
+                        success = gemini_client.upload_file(
+                            store["id"],
+                            file_path,
+                            file_name,
+                            source_url=url  # Save source URL for citations
+                        )
+                        if success:
+                            success_count += 1
+                            results.append(f"+ {file_name}")
+                        else:
+                            error_count += 1
+                            results.append(f"- {file_name} (upload failed)")
+                        file_path.unlink(missing_ok=True)
+                    else:
+                        error_count += 1
+                        results.append(f"- {file_id[:20]}... (download failed)")
+
+            except Exception as e:
+                logger.error(f"Error processing {file_id}: {e}")
+                error_count += 1
+                results.append(f"- {file_id[:20]}... ({str(e)[:30]})")
+
+        # Clean up temp dir
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        # Format results
+        results_text = "\n".join(results[:20])
+        if len(results) > 20:
+            results_text += f"\n... and {len(results) - 20} more"
+
+        await status_msg.edit_text(
+            f"Upload complete!\n\n"
+            f"Store: {store_name}\n"
+            f"Success: {success_count}\n"
+            f"Errors: {error_count}\n\n"
+            f"Files:\n{results_text}"
+        )
+
+    except Exception as e:
+        logger.exception("Error in uploadurl")
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        await status_msg.edit_text(f"Error: {str(e)[:500]}")
+
+
 async def list_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /list command - show all stores"""
     if not check_user_allowed(update.effective_user.id):
@@ -286,10 +488,16 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Access denied.")
         return
 
+    if drive_client and drive_client.is_configured():
+        drive_status = "OK (Service Account)"
+    else:
+        drive_status = "OK (public URLs only)"
+
     status_lines = [
         "Status:",
         f"- Gemini API: {'OK' if gemini_client else 'Not configured'}",
         f"- Smart routing: {'OK' if router else 'Not configured'}",
+        f"- Google Drive: {drive_status}",
         f"- Stores: {len(gemini_client.stores) if gemini_client else 0}",
         f"- Model: {GEMINI_MODEL}",
         f"- Thinking level: {GEMINI_THINKING_LEVEL}",
@@ -423,8 +631,578 @@ async def handle_think(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"Error: {str(e)[:500]}")
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo messages - analyze images with Gemini Vision"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    # Get the largest photo
+    photo = update.message.photo[-1]
+
+    # Get prompt from caption or use default
+    caption = update.message.caption
+    prompt = caption.strip() if caption else IMAGE_DEFAULT_PROMPT
+
+    await update.message.chat.send_action("typing")
+    status_msg = await update.message.reply_text("Analyzing image...")
+
+    try:
+        # Download photo
+        file = await photo.get_file()
+        temp_path = Path(f"/tmp/photo_{photo.file_id}.jpg")
+        await file.download_to_drive(temp_path)
+
+        # Analyze with Gemini
+        result = gemini_client.analyze_image(temp_path, prompt, model=GEMINI_MODEL)
+
+        # Clean up
+        temp_path.unlink(missing_ok=True)
+
+        if result:
+            if len(result) > 4000:
+                parts = [result[i:i+4000] for i in range(0, len(result), 4000)]
+                await status_msg.edit_text(parts[0])
+                for part in parts[1:]:
+                    await update.message.reply_text(part)
+            else:
+                await status_msg.edit_text(result)
+        else:
+            await status_msg.edit_text("Could not analyze the image.")
+
+    except Exception as e:
+        logger.exception("Error analyzing photo")
+        await status_msg.edit_text(f"Error: {str(e)[:500]}")
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages - transcribe and process as question"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    voice = update.message.voice
+
+    await update.message.chat.send_action("typing")
+    status_msg = await update.message.reply_text("Transcribing voice...")
+
+    try:
+        # Download voice message
+        file = await voice.get_file()
+        temp_path = Path(f"/tmp/voice_{voice.file_id}.ogg")
+        await file.download_to_drive(temp_path)
+
+        # Transcribe with Gemini
+        transcription = gemini_client.transcribe_voice(temp_path, model=GEMINI_MODEL)
+
+        # Clean up
+        temp_path.unlink(missing_ok=True)
+
+        if not transcription:
+            await status_msg.edit_text("Could not transcribe voice message.")
+            return
+
+        await status_msg.edit_text(f"Transcribed: {transcription}\n\nProcessing...")
+
+        # Process transcription as a question if there are stores
+        if not gemini_client.stores:
+            await status_msg.edit_text(
+                f"Transcribed: {transcription}\n\n"
+                "No knowledge stores available to answer the question."
+            )
+            return
+
+        # Route and answer the question
+        if router and len(gemini_client.stores) > 1:
+            selected, reasoning = router.route_with_reasoning(transcription, max_notebooks=1)
+            store = selected[0] if selected else gemini_client.stores[0]
+        else:
+            store = gemini_client.stores[0]
+
+        answer = gemini_client.ask_question(
+            store["id"],
+            transcription,
+            model=GEMINI_MODEL
+        )
+
+        if answer:
+            response_text = f"Voice: {transcription}\n\n{answer}"
+            if len(response_text) > 4000:
+                parts = [response_text[i:i+4000] for i in range(0, len(response_text), 4000)]
+                await status_msg.edit_text(parts[0])
+                for part in parts[1:]:
+                    await update.message.reply_text(part)
+            else:
+                await status_msg.edit_text(response_text)
+        else:
+            await status_msg.edit_text(
+                f"Transcribed: {transcription}\n\n"
+                "Could not find an answer in the knowledge stores."
+            )
+
+    except Exception as e:
+        logger.exception("Error handling voice")
+        await status_msg.edit_text(f"Error: {str(e)[:500]}")
+
+
+async def set_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /setsync command - set URLs for auto-sync (admin only)"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not is_admin(user_id):
+        await update.message.reply_text("Only admin can configure sync.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    # Parse: /setsync <store_name> <url1> [url2] ...
+    message_text = update.message.text
+    args_text = re.sub(r'^/setsync\s*', '', message_text, flags=re.IGNORECASE).strip()
+
+    if not args_text:
+        await update.message.reply_text(
+            "Usage: /setsync <store_name> <url1> [url2] ...\n\n"
+            "Example:\n"
+            "/setsync MyStore https://docs.google.com/document/d/xxx\n\n"
+            "URLs will be synced daily at 3:00 AM."
+        )
+        return
+
+    parts = args_text.split(None, 1)
+    store_name = parts[0]
+    urls_text = parts[1] if len(parts) > 1 else ""
+
+    store = gemini_client.get_store_by_name(store_name)
+    if not store:
+        await update.message.reply_text(f"Store not found: {store_name}")
+        return
+
+    # Extract URLs
+    urls = GoogleDriveClient.extract_all_urls(urls_text)
+    if not urls:
+        await update.message.reply_text(
+            "No valid Google URLs found.\n"
+            "Supported: docs.google.com, drive.google.com"
+        )
+        return
+
+    url_list = [url for url, _, _ in urls]
+
+    if gemini_client.set_sync_urls(store["id"], url_list):
+        await update.message.reply_text(
+            f"Sync configured!\n\n"
+            f"Store: {store_name}\n"
+            f"URLs: {len(url_list)}\n"
+            f"Auto-sync: Enabled (daily at 3:00 AM)\n\n"
+            f"Use /syncnow {store_name} to sync immediately."
+        )
+    else:
+        await update.message.reply_text("Failed to configure sync. Check logs.")
+
+
+async def sync_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /syncnow command - force sync stores (admin only)"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not is_admin(user_id):
+        await update.message.reply_text("Only admin can sync stores.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    # Parse: /syncnow [store_name]
+    args_text = re.sub(r'^/syncnow\s*', '', update.message.text, flags=re.IGNORECASE).strip()
+
+    if args_text:
+        # Sync specific store
+        store = gemini_client.get_store_by_name(args_text)
+        if not store:
+            await update.message.reply_text(f"Store not found: {args_text}")
+            return
+        stores_to_sync = [store]
+    else:
+        # Sync all stores with auto_sync enabled
+        stores_to_sync = gemini_client.get_stores_for_sync()
+        if not stores_to_sync:
+            await update.message.reply_text(
+                "No stores configured for sync.\n"
+                "Use /setsync to configure."
+            )
+            return
+
+    status_msg = await update.message.reply_text(
+        f"Syncing {len(stores_to_sync)} store(s)..."
+    )
+
+    results = []
+
+    for store in stores_to_sync:
+        sync_urls = store.get("sync_urls", [])
+        if not sync_urls:
+            results.append(f"- {store.get('name')}: No sync URLs configured")
+            continue
+
+        await status_msg.edit_text(f"Syncing {store.get('name')}...")
+
+        success_count = 0
+        error_count = 0
+
+        import tempfile
+        temp_dir = Path(tempfile.mkdtemp(prefix="sync_"))
+
+        try:
+            for url in sync_urls:
+                extracted = GoogleDriveClient.extract_file_id(url)
+                if not extracted:
+                    error_count += 1
+                    continue
+
+                file_id, file_type = extracted
+
+                if file_type == 'folder':
+                    if drive_client and drive_client.is_configured():
+                        downloaded = drive_client.download_folder(file_id, temp_dir)
+                        for file_path, file_name in downloaded:
+                            if gemini_client.upload_file(store["id"], file_path, file_name):
+                                success_count += 1
+                            else:
+                                error_count += 1
+                            file_path.unlink(missing_ok=True)
+                    else:
+                        error_count += 1
+                else:
+                    file_path = drive_client.download_file(file_id, temp_dir, file_type=file_type)
+                    if file_path:
+                        if gemini_client.upload_file(store["id"], file_path, file_path.name):
+                            success_count += 1
+                        else:
+                            error_count += 1
+                        file_path.unlink(missing_ok=True)
+                    else:
+                        error_count += 1
+
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+            gemini_client.update_last_sync(store["id"])
+            results.append(f"- {store.get('name')}: +{success_count} files, {error_count} errors")
+
+        except Exception as e:
+            logger.error(f"Sync error for {store.get('name')}: {e}")
+            results.append(f"- {store.get('name')}: Error - {str(e)[:50]}")
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    await status_msg.edit_text(
+        f"Sync complete!\n\n" + "\n".join(results)
+    )
+
+
+async def auto_sync_callback(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue callback for daily auto-sync"""
+    logger.info("Running scheduled auto-sync...")
+
+    stores_to_sync = gemini_client.get_stores_for_sync()
+    if not stores_to_sync:
+        logger.info("No stores configured for auto-sync")
+        return
+
+    for store in stores_to_sync:
+        sync_urls = store.get("sync_urls", [])
+        if not sync_urls:
+            continue
+
+        logger.info(f"Auto-syncing {store.get('name')} ({len(sync_urls)} URLs)...")
+
+        import tempfile
+        temp_dir = Path(tempfile.mkdtemp(prefix="autosync_"))
+        success_count = 0
+        error_count = 0
+
+        try:
+            for url in sync_urls:
+                extracted = GoogleDriveClient.extract_file_id(url)
+                if not extracted:
+                    error_count += 1
+                    continue
+
+                file_id, file_type = extracted
+
+                if file_type == 'folder':
+                    if drive_client and drive_client.is_configured():
+                        downloaded = drive_client.download_folder(file_id, temp_dir)
+                        for file_path, file_name in downloaded:
+                            if gemini_client.upload_file(store["id"], file_path, file_name):
+                                success_count += 1
+                            else:
+                                error_count += 1
+                            file_path.unlink(missing_ok=True)
+                    else:
+                        error_count += 1
+                else:
+                    file_path = drive_client.download_file(file_id, temp_dir, file_type=file_type)
+                    if file_path:
+                        if gemini_client.upload_file(store["id"], file_path, file_path.name):
+                            success_count += 1
+                        else:
+                            error_count += 1
+                        file_path.unlink(missing_ok=True)
+                    else:
+                        error_count += 1
+
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+            gemini_client.update_last_sync(store["id"])
+            logger.info(f"Auto-sync {store.get('name')}: +{success_count} files, {error_count} errors")
+
+        except Exception as e:
+            logger.error(f"Auto-sync error for {store.get('name')}: {e}")
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def compare_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /compare command - compare two stores by topic"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    # Parse: /compare <store1> <store2> <topic>
+    message_text = update.message.text
+    args_text = re.sub(r'^/compare\s*', '', message_text, flags=re.IGNORECASE).strip()
+
+    if not args_text:
+        stores_list = ", ".join([s.get("name", "?") for s in gemini_client.stores[:5]])
+        await update.message.reply_text(
+            "Usage: /compare <store1> <store2> <topic>\n\n"
+            "Example:\n"
+            "/compare ТендерА ТендерБ водопонижение\n\n"
+            f"Available stores: {stores_list}"
+        )
+        return
+
+    parts = args_text.split(None, 2)
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "Please provide two store names and a topic.\n"
+            "Example: /compare Store1 Store2 земляные работы"
+        )
+        return
+
+    store_name_1, store_name_2, topic = parts
+
+    store_1 = gemini_client.get_store_by_name(store_name_1)
+    store_2 = gemini_client.get_store_by_name(store_name_2)
+
+    if not store_1:
+        await update.message.reply_text(f"Store not found: {store_name_1}")
+        return
+
+    if not store_2:
+        await update.message.reply_text(f"Store not found: {store_name_2}")
+        return
+
+    await update.message.chat.send_action("typing")
+    status_msg = await update.message.reply_text(
+        f"Comparing {store_1.get('name')} vs {store_2.get('name')}\n"
+        f"Topic: {topic}\n\n"
+        "This may take a moment..."
+    )
+
+    try:
+        result = gemini_client.compare_stores(
+            store_1["id"],
+            store_2["id"],
+            topic,
+            model=GEMINI_MODEL
+        )
+
+        if result:
+            header = f"Сравнение: {store_1.get('name')} vs {store_2.get('name')}\n"
+            header += f"Тема: {topic}\n\n"
+            full_response = header + result
+
+            if len(full_response) > 4000:
+                parts = [full_response[i:i+4000] for i in range(0, len(full_response), 4000)]
+                await status_msg.edit_text(parts[0])
+                for part in parts[1:]:
+                    await update.message.reply_text(part)
+            else:
+                await status_msg.edit_text(full_response)
+        else:
+            await status_msg.edit_text(
+                f"Could not generate comparison for topic: {topic}"
+            )
+
+    except Exception as e:
+        logger.exception("Error in compare")
+        await status_msg.edit_text(f"Error: {str(e)[:500]}")
+
+
+async def export_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /export command - export last response to PDF/DOCX"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    # Parse: /export [question] or just /export
+    args_text = re.sub(r'^/export\s*', '', update.message.text, flags=re.IGNORECASE).strip()
+
+    last_response = context.user_data.get("last_response")
+
+    if args_text:
+        # User provided a new question - process it and export
+        await update.message.reply_text(
+            "Processing your question for export...\n"
+            "Use /export without arguments to export the last answer."
+        )
+        return
+
+    if not last_response:
+        await update.message.reply_text(
+            "No previous response to export.\n"
+            "Ask a question first, then use /export."
+        )
+        return
+
+    # Show export options
+    keyboard = [
+        [
+            InlineKeyboardButton("PDF", callback_data="export_pdf"),
+            InlineKeyboardButton("DOCX", callback_data="export_docx"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"Export response about:\n"
+        f"Q: {last_response.get('question', '')[:100]}...\n\n"
+        f"Choose format:",
+        reply_markup=reply_markup
+    )
+
+
+async def handle_export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle export format selection callback"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not check_user_allowed(user_id):
+        await query.edit_message_text("Access denied.")
+        return
+
+    last_response = context.user_data.get("last_response")
+    if not last_response:
+        await query.edit_message_text("Response expired. Ask a new question.")
+        return
+
+    export_format = query.data.replace("export_", "")
+
+    await query.edit_message_text(f"Generating {export_format.upper()}...")
+
+    question = last_response.get("question", "")
+    answer = last_response.get("answer", "")
+    store_name = last_response.get("store", "")
+    title = question[:50] if question else "Export"
+
+    if export_format == "pdf":
+        file_path = export_client.export_to_pdf(
+            content=answer,
+            title=title,
+            question=question,
+            store_name=store_name
+        )
+    else:
+        file_path = export_client.export_to_docx(
+            content=answer,
+            title=title,
+            question=question,
+            store_name=store_name
+        )
+
+    if file_path and file_path.exists():
+        await query.edit_message_text(f"Sending {export_format.upper()}...")
+
+        with open(file_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=f,
+                filename=file_path.name,
+                caption=f"Export: {title}"
+            )
+
+        # Clean up file
+        file_path.unlink(missing_ok=True)
+        await query.delete_message()
+    else:
+        await query.edit_message_text(
+            f"Failed to generate {export_format.upper()}.\n"
+            "Make sure reportlab (PDF) or python-docx (DOCX) is installed."
+        )
+
+
+def get_export_keyboard():
+    """Get inline keyboard for export options."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("PDF", callback_data="export_pdf"),
+            InlineKeyboardButton("DOCX", callback_data="export_docx"),
+        ]
+    ])
+
+
+async def clear_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /clear command - clear conversation history"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    memory_client.clear_history(user_id)
+
+    await update.message.reply_text(
+        "История диалога очищена.\n"
+        "Бот забыл контекст предыдущих вопросов."
+    )
+
+
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle user questions with smart routing"""
+    """Handle user questions with smart routing, memory, and multistore support"""
     user_id = update.effective_user.id
 
     if not check_user_allowed(user_id):
@@ -451,6 +1229,60 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("Analyzing question...")
 
     try:
+        # Check if this requires web search
+        if detect_web_search_query(question):
+            await status_msg.edit_text("Searching the web...")
+
+            answer = gemini_client.ask_with_web_search(question, model=GEMINI_MODEL)
+
+            if answer:
+                # Prefix with web search indicator
+                answer = f"[Результат веб-поиска]\n\n{answer}"
+
+                # Save to memory
+                memory_client.add_message(user_id, "web", "user", question)
+                memory_client.add_message(user_id, "web", "assistant", answer)
+
+                if len(answer) > 4000:
+                    parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
+                    await status_msg.edit_text(parts[0])
+                    for part in parts[1:]:
+                        await update.message.reply_text(part)
+                else:
+                    await status_msg.edit_text(answer)
+            else:
+                await status_msg.edit_text("Не удалось выполнить веб-поиск.")
+            return
+
+        # Check if this is a multistore query
+        if len(gemini_client.stores) > 1 and detect_multistore_query(question):
+            await status_msg.edit_text(
+                f"Searching across {len(gemini_client.stores)} stores..."
+            )
+
+            # Query all stores in parallel
+            store_ids = [s["id"] for s in gemini_client.stores]
+            results = gemini_client.ask_multistore_parallel(
+                store_ids, question, model=GEMINI_MODEL
+            )
+
+            # Format and send response
+            answer = gemini_client.format_multistore_response(results)
+
+            # Save to memory with "global" store ID
+            memory_client.add_message(user_id, "global", "user", question)
+            memory_client.add_message(user_id, "global", "assistant", answer)
+
+            if len(answer) > 4000:
+                parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
+                await status_msg.edit_text(parts[0])
+                for part in parts[1:]:
+                    await update.message.reply_text(part)
+            else:
+                await status_msg.edit_text(answer)
+            return
+
+        # Regular single-store query
         # Route the question
         if router and len(gemini_client.stores) > 1:
             selected, reasoning = router.route_with_reasoning(question, max_notebooks=1)
@@ -468,21 +1300,59 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             store = gemini_client.stores[0]
             await status_msg.edit_text(f"Querying {store.get('name')}...")
 
+        # Get conversation context from memory
+        context_prompt = memory_client.get_context_prompt(user_id, store["id"])
+
+        # Build question with context
+        if context_prompt:
+            question_with_context = f"{context_prompt}\n{question}"
+        else:
+            question_with_context = question
+
+        # Save user message to memory
+        memory_client.add_message(user_id, store["id"], "user", question)
+
+        # Check if user wants sources
+        include_sources = detect_source_request(question)
+
         # Get answer from Gemini
-        answer = gemini_client.ask_question(
-            store["id"],
-            question,
-            model=GEMINI_MODEL
-        )
+        if include_sources:
+            answer = gemini_client.ask_with_sources(
+                store["id"],
+                question_with_context,
+                model=GEMINI_MODEL
+            )
+        else:
+            answer = gemini_client.ask_question(
+                store["id"],
+                question_with_context,
+                model=GEMINI_MODEL
+            )
 
         if answer:
+            # Save assistant response to memory
+            memory_client.add_message(user_id, store["id"], "assistant", answer)
+
+            # Save for export
+            context.user_data["last_response"] = {
+                "question": question,
+                "answer": answer,
+                "store": store.get("name", ""),
+                "timestamp": datetime.now().isoformat()
+            }
+
             if len(answer) > 4000:
                 parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
                 await status_msg.edit_text(parts[0])
                 for part in parts[1:]:
                     await update.message.reply_text(part)
+                # Add export buttons to last message
+                await update.message.reply_text(
+                    "Export:",
+                    reply_markup=get_export_keyboard()
+                )
             else:
-                await status_msg.edit_text(answer)
+                await status_msg.edit_text(answer, reply_markup=get_export_keyboard())
         else:
             await status_msg.edit_text(
                 "No answer received.\n"
@@ -492,6 +1362,14 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Error handling question")
         await status_msg.edit_text(f"Error: {str(e)[:500]}")
+
+
+async def memory_cleanup_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue callback for weekly memory cleanup"""
+    logger.info("Running scheduled memory cleanup...")
+    memory_client.cleanup_old_entries(days=MEMORY_CLEANUP_DAYS)
+    stats = memory_client.get_stats()
+    logger.info(f"Memory stats after cleanup: {stats}")
 
 
 def main():
@@ -514,19 +1392,52 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Schedule weekly memory cleanup (every Sunday at 4:00 AM)
+    job_queue = app.job_queue
+    job_queue.run_daily(
+        memory_cleanup_job,
+        time=time(hour=4, minute=0),
+        days=(6,),  # Sunday
+        name="memory_cleanup"
+    )
+    print("Scheduled: Weekly memory cleanup (Sundays 4:00 AM)")
+
+    # Schedule daily auto-sync (3:00 AM)
+    job_queue.run_daily(
+        auto_sync_callback,
+        time=time(hour=3, minute=0),
+        name="auto_sync"
+    )
+    print("Scheduled: Daily auto-sync (3:00 AM)")
+
     # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("add", add_store))
     app.add_handler(CommandHandler("upload", upload_file))
+    app.add_handler(CommandHandler("uploadurl", upload_from_url))
     app.add_handler(CommandHandler("list", list_stores))
     app.add_handler(CommandHandler("status", check_status))
     app.add_handler(CommandHandler("sync", sync_stores))
     app.add_handler(CommandHandler("delete", delete_store))
     app.add_handler(CommandHandler("think", handle_think))
+    app.add_handler(CommandHandler("clear", clear_memory))
+    app.add_handler(CommandHandler("compare", compare_stores))
+    app.add_handler(CommandHandler("setsync", set_sync))
+    app.add_handler(CommandHandler("syncnow", sync_now))
+    app.add_handler(CommandHandler("export", export_response))
+
+    # Callback handler for export buttons
+    app.add_handler(CallbackQueryHandler(handle_export_callback, pattern="^export_"))
 
     # File handler (for /upload flow)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+
+    # Photo handler
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # Voice handler
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     # Question handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question))
