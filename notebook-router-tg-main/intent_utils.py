@@ -27,7 +27,10 @@ def infer_action_from_text(text: str) -> ActionResult:
     lower = original.lower()
 
     # List stores
-    if re.search(r"\b(список|перечисли|покажи|какие|какие есть)\b.*\b(тендер|тендеры|store|stores|баз|проект)\b", lower):
+    if re.search(
+        r"\b(список|перечисли|покажи|какие|какие есть)\b.*\b(тендер|тендеры|тендеров|тендерах|store|stores|баз|проект)\b",
+        lower
+    ):
         return "list_stores", {}
 
     # Status
@@ -55,7 +58,11 @@ def infer_action_from_text(text: str) -> ActionResult:
             return "select_store", {"store_name": store_name}
 
     # Rename store
-    m = re.search(r"\b(переименуй|переименовать|rename)\b\s*(?:тендер|store|баз[ау])?\s*(.+?)\s*(?:в|на)\s*(.+)", original, re.IGNORECASE)
+    m = re.search(
+        r"\b(переименуй|переименовать|rename)\b\s*(?:тендер|store|баз[ау])?\s*(.+?)\s+(?:в|на)\s+(.+)",
+        original,
+        re.IGNORECASE
+    )
     if m:
         old_name = _clean_store_name(m.group(2))
         new_name = _clean_store_name(m.group(3))
@@ -87,6 +94,14 @@ def extract_target_store_hint(text: str) -> Optional[str]:
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return _clean_store_name(match.group(1))
+            name = _clean_store_name(match.group(1))
+            # Trim common question continuations
+            name = re.sub(
+                r"\b(что|какие|какой|когда|сколько|нужно|есть|требования|сроки|цены|стоимость)\b.*$",
+                "",
+                name,
+                flags=re.IGNORECASE
+            ).strip()
+            return _clean_store_name(name)
 
     return None
