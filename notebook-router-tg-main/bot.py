@@ -35,6 +35,8 @@ from config import (
     ADMIN_USER_ID,
     STORES_FILE,
     GEMINI_MODEL,
+    GEMINI_MODEL_FLASH,
+    GEMINI_MODEL_PRO,
     GEMINI_THINKING_LEVEL,
     GOOGLE_SERVICE_ACCOUNT_FILE,
     IMAGE_DEFAULT_PROMPT,
@@ -94,11 +96,11 @@ logger.info(f"Memory client initialized (max {MEMORY_MAX_MESSAGES} messages per 
 export_client = ExportClient()
 logger.info("Export client initialized")
 
-# Initialize query processor (ultrathinking for understanding user intent)
+# Initialize query processor (uses Pro model for complex understanding)
 query_processor = None
 if GEMINI_API_KEY:
-    query_processor = QueryProcessor(GEMINI_API_KEY, model=GEMINI_MODEL)
-    logger.info("Query processor initialized with ultrathinking")
+    query_processor = QueryProcessor(GEMINI_API_KEY, model=GEMINI_MODEL_PRO)
+    logger.info(f"Query processor initialized with Pro model: {GEMINI_MODEL_PRO}")
 
 
 def check_user_allowed(user_id: int) -> bool:
@@ -504,12 +506,13 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Status:",
         f"- Gemini API: {'OK' if gemini_client else 'Not configured'}",
         f"- Smart routing: {'OK' if router else 'Not configured'}",
+        f"- Query processor: {'OK' if query_processor else 'Not configured'}",
         f"- Google Drive: {drive_status}",
         f"- Stores: {len(gemini_client.stores) if gemini_client else 0}",
-        f"- Model: {GEMINI_MODEL}",
-        f"- Thinking level: {GEMINI_THINKING_LEVEL}",
+        f"- Model Flash: {GEMINI_MODEL_FLASH}",
+        f"- Model Pro: {GEMINI_MODEL_PRO}",
         "",
-        "Powered by Gemini 3 Flash"
+        "Smart model selection: Flash for simple, Pro for complex"
     ]
 
     await update.message.reply_text("\n".join(status_lines))
@@ -731,12 +734,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Process with ultrathinking
+        # Process with Pro model for understanding
         processed = query_processor.process_query(
             question=transcription,
             available_stores=gemini_client.stores,
             conversation_context=""
         )
+
+        # Select model based on complexity
+        if processed.complexity == "complex":
+            voice_model = GEMINI_MODEL_PRO
+        else:
+            voice_model = GEMINI_MODEL_FLASH
 
         # Route to best store
         if router and len(gemini_client.stores) > 1:
@@ -751,7 +760,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer = gemini_client.ask_question(
             store["id"],
             processed.optimized_prompt,  # Use optimized prompt
-            model=GEMINI_MODEL
+            model=voice_model
         )
 
         if answer:
@@ -1058,11 +1067,12 @@ async def compare_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+        # Comparisons always use Pro model (complex analysis)
         result = gemini_client.compare_stores(
             store_1["id"],
             store_2["id"],
             topic,
-            model=GEMINI_MODEL
+            model=GEMINI_MODEL_PRO
         )
 
         if result:
@@ -1259,8 +1269,18 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conversation_context=conversation_context
         )
 
-        logger.info(f"Query type: {processed.query_type}, intent: {processed.user_intent}, "
-                   f"confidence: {processed.confidence}")
+        logger.info(f"Query type: {processed.query_type}, complexity: {processed.complexity}, "
+                   f"intent: {processed.user_intent}, confidence: {processed.confidence}")
+
+        # Select model based on complexity
+        # Simple/Medium -> Flash (fast, cheap)
+        # Complex -> Pro (smart, thorough)
+        if processed.complexity == "complex":
+            query_model = GEMINI_MODEL_PRO
+            logger.info(f"Using Pro model for complex query")
+        else:
+            query_model = GEMINI_MODEL_FLASH
+            logger.info(f"Using Flash model for {processed.complexity} query")
 
         # Show what AI understood
         intent_text = f"Понял: {processed.user_intent}" if processed.user_intent else ""
@@ -1271,7 +1291,7 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             answer = gemini_client.ask_with_web_search(
                 processed.optimized_prompt,
-                model=GEMINI_MODEL
+                model=query_model
             )
 
             if answer:
@@ -1293,7 +1313,7 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results = gemini_client.ask_multistore_parallel(
                 store_ids,
                 processed.optimized_prompt,  # Use optimized prompt
-                model=GEMINI_MODEL
+                model=query_model
             )
 
             answer = gemini_client.format_multistore_response(results)
@@ -1315,11 +1335,12 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"Comparing {store_1.get('name')} vs {store_2.get('name')}..."
                     )
 
+                    # Comparisons always use Pro model (complex task)
                     result = gemini_client.compare_stores(
                         store_1["id"],
                         store_2["id"],
                         processed.compare_topic or processed.optimized_prompt,
-                        model=GEMINI_MODEL
+                        model=GEMINI_MODEL_PRO
                     )
 
                     if result:
@@ -1367,13 +1388,13 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = gemini_client.ask_with_sources(
                 store["id"],
                 final_prompt,
-                model=GEMINI_MODEL
+                model=query_model
             )
         else:
             answer = gemini_client.ask_question(
                 store["id"],
                 final_prompt,
-                model=GEMINI_MODEL
+                model=query_model
             )
 
         if answer:
@@ -1429,12 +1450,12 @@ def main():
         print("Get your API key from: https://aistudio.google.com/app/apikey")
         sys.exit(1)
 
-    print("Starting Gemini 3 Flash Bot...")
+    print("Starting Gemini Bot...")
     print(f"Stores: {len(gemini_client.stores) if gemini_client else 0}")
     print(f"Routing: {'enabled' if router else 'disabled'}")
-    print(f"Model: {GEMINI_MODEL}")
-    print(f"Thinking level: {GEMINI_THINKING_LEVEL}")
-    print("Powered by Gemini 3 Flash")
+    print(f"Model Flash (simple/medium): {GEMINI_MODEL_FLASH}")
+    print(f"Model Pro (complex): {GEMINI_MODEL_PRO}")
+    print("Smart model selection based on query complexity")
 
     app = Application.builder().token(BOT_TOKEN).build()
 

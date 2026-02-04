@@ -1,10 +1,14 @@
 """
-Smart Query Processor with Ultrathinking
+Smart Query Processor
 
-Uses Gemini with high thinking level to:
+Uses Gemini Pro (full model) for complex understanding:
 1. Understand user intent even with typos/errors
 2. Detect query type (single store, multistore, web search, compare, sources)
 3. Generate optimal prompt for the knowledge store
+
+Model strategy:
+- Gemini Pro: Query analysis, intent detection, prompt optimization
+- Gemini Flash: Simple store queries (handled elsewhere)
 """
 
 import json
@@ -29,11 +33,12 @@ class ProcessedQuery:
     original_question: str
     user_intent: str  # Brief description of what user wants
     confidence: float  # 0-1 confidence in interpretation
+    complexity: str  # "simple", "medium", "complex" - for model selection
 
 
 class QueryProcessor:
     """
-    Smart query processor using Gemini ultrathinking.
+    Smart query processor using Gemini Pro model.
 
     Understands user intent even with:
     - Typos and spelling errors
@@ -42,16 +47,16 @@ class QueryProcessor:
     - Implicit context from conversation
     """
 
-    def __init__(self, api_key: str, model: str = "gemini-3-flash-preview"):
+    def __init__(self, api_key: str, model: str = "gemini-2.5-pro-preview-05-06"):
         """
         Initialize the processor.
 
         Args:
             api_key: Gemini API key
-            model: Gemini model to use
+            model: Gemini Pro model for complex analysis
         """
         self.client = genai.Client(api_key=api_key)
-        self.model = model
+        self.model = model  # Pro model for understanding
 
     def process_query(
         self,
@@ -111,7 +116,8 @@ class QueryProcessor:
     "target_store": "имя store для single запроса или null",
     "compare_stores": ["store1", "store2"] или null,
     "compare_topic": "тема сравнения или null",
-    "confidence": 0.0-1.0
+    "confidence": 0.0-1.0,
+    "complexity": "simple|medium|complex"
 }}
 
 ПРАВИЛА ФОРМИРОВАНИЯ optimized_prompt:
@@ -121,6 +127,11 @@ class QueryProcessor:
 4. Укажи что нужен структурированный ответ
 5. Сохрани язык пользователя (русский)
 
+ОПРЕДЕЛИ СЛОЖНОСТЬ ЗАПРОСА:
+- "simple" - простой факт, одно значение (Какой срок? Какая цена?)
+- "medium" - требует поиска и структурирования (Опиши требования к...)
+- "complex" - сравнение, анализ, синтез из нескольких источников
+
 JSON:"""
 
         try:
@@ -129,16 +140,14 @@ JSON:"""
                 contents=analysis_prompt,
                 config=types.GenerateContentConfig(
                     temperature=0.1,
-                    max_output_tokens=1500,
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level="high"  # Ultrathinking for best understanding
-                    )
+                    max_output_tokens=1500
                 )
             )
 
             # Parse JSON response
             result = self._parse_response(response.text, question)
-            logger.info(f"Query processed: type={result.query_type}, intent='{result.user_intent}'")
+            logger.info(f"Query processed: type={result.query_type}, complexity={result.complexity}, "
+                       f"intent='{result.user_intent}'")
             return result
 
         except Exception as e:
@@ -152,7 +161,8 @@ JSON:"""
                 compare_topic=None,
                 original_question=question,
                 user_intent="Не удалось определить",
-                confidence=0.0
+                confidence=0.0,
+                complexity="medium"
             )
 
     def _format_stores_info(self, stores: List[Dict]) -> str:
@@ -188,7 +198,8 @@ JSON:"""
             compare_topic=data.get("compare_topic"),
             original_question=original_question,
             user_intent=data.get("user_intent", ""),
-            confidence=float(data.get("confidence", 0.5))
+            confidence=float(data.get("confidence", 0.5)),
+            complexity=data.get("complexity", "medium")
         )
 
     def enhance_for_store(
@@ -230,10 +241,7 @@ JSON:"""
                 contents=enhance_prompt,
                 config=types.GenerateContentConfig(
                     temperature=0.2,
-                    max_output_tokens=500,
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level="high"
-                    )
+                    max_output_tokens=500
                 )
             )
 
