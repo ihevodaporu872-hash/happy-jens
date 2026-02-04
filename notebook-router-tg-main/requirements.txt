@@ -1,10 +1,11 @@
 # NotebookLM Telegram Bot Dependencies
+# 100% Gemini-powered - no OpenAI
 
-# Telegram Bot API (with job-queue for background sync)
+# Telegram Bot API
 python-telegram-bot[job-queue]>=21.0
 
-# OpenAI API for smart routing (GPT-4o-mini)
-openai>=1.0.0
+# Google Gemini API for everything
+google-genai>=1.0.0
 
 # Environment variables
-python-dotenv==1.0.0
+python-dotenv>=1.0.0

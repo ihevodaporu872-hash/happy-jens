@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-NotebookLM Telegram Bot with Smart Routing
+NotebookLM Telegram Bot - Gemini 3 Flash Powered
 
-Sends questions to NotebookLM with intelligent notebook selection via Claude API.
+Uses Gemini 3 Flash for everything:
+- File Search API for document Q&A
+- Smart routing between stores
+- Thinking levels (minimal/low/medium/high)
+
+No OpenAI dependency. Pure Gemini 3.
 """
 
-import asyncio
-import subprocess
 import logging
 import sys
-import json
-import os
-import shlex
 import re
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 
 from telegram import Update
 from telegram.ext import (
@@ -27,24 +26,16 @@ from telegram.ext import (
 
 from config import (
     BOT_TOKEN,
-    ANTHROPIC_API_KEY,
-    SKILL_PATH,
-    SCRIPTS_PATH,
-    SKILL_PYTHON,
+    GEMINI_API_KEY,
     ALLOWED_USERS,
     QUERY_TIMEOUT,
-    MAX_PARALLEL_QUERIES,
-    AUTO_SYNC_INTERVAL,
     ADMIN_USER_ID,
-    NOTEBOOKS_FILE,
+    STORES_FILE,
+    GEMINI_MODEL,
+    GEMINI_THINKING_LEVEL,
 )
-from router import NotebookRouter, add_notebook_to_library, generate_descriptions
-from notebooks_manager import (
-    extract_notebook_id,
-    add_notebook as add_notebook_to_file,
-    list_notebooks as get_all_notebooks,
-    load_notebooks,
-)
+from router import NotebookRouter
+from gemini_client import GeminiFileSearchClient
 
 # Setup logging
 logging.basicConfig(
@@ -53,16 +44,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize router - use new notebooks.json format
-router = None
-if ANTHROPIC_API_KEY:
-    router = NotebookRouter(ANTHROPIC_API_KEY, NOTEBOOKS_FILE)
-    logger.info("Smart routing enabled with Claude API")
+# Initialize Gemini client
+gemini_client = None
+if GEMINI_API_KEY:
+    gemini_client = GeminiFileSearchClient(GEMINI_API_KEY, STORES_FILE)
+    logger.info(f"Gemini File Search enabled. Stores: {len(gemini_client.stores)}")
 else:
-    logger.warning("ANTHROPIC_API_KEY not set - smart routing disabled")
+    logger.warning("GEMINI_API_KEY not set - file search disabled")
 
-# Thread pool for parallel queries
-executor = ThreadPoolExecutor(max_workers=MAX_PARALLEL_QUERIES)
+# Initialize router (now uses Gemini)
+router = None
+if GEMINI_API_KEY and gemini_client:
+    router = NotebookRouter(GEMINI_API_KEY, STORES_FILE, model=GEMINI_MODEL)
+    logger.info("Smart routing enabled with Gemini")
+else:
+    logger.warning("Router not initialized (missing API key)")
 
 
 def check_user_allowed(user_id: int) -> bool:
@@ -83,249 +79,205 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Access denied.")
         return
 
-    routing_status = "enabled" if router else "disabled (no API key)"
+    gemini_status = "enabled" if gemini_client else "disabled (no API key)"
+    routing_status = "enabled" if router else "disabled"
     admin_note = " (you are admin)" if is_admin(update.effective_user.id) else ""
+    stores_count = len(gemini_client.stores) if gemini_client else 0
 
     await update.message.reply_text(
-        f"NotebookLM Router Bot{admin_note}\n\n"
-        f"Smart routing: {routing_status}\n\n"
+        f"Gemini 3 Flash Bot{admin_note}\n\n"
+        f"Model: {GEMINI_MODEL}\n"
+        f"File Search: {gemini_status}\n"
+        f"Smart routing: {routing_status}\n"
+        f"Stores: {stores_count}\n\n"
         "Commands:\n"
-        "/list - Show all notebooks\n"
-        "/status - Check status\n\n"
-        "Just send a message to query your notebooks!\n"
-        "The bot will automatically find the right notebook."
+        "/list - Show all stores\n"
+        "/status - Check status\n"
+        "/think <question> - Deep thinking mode\n"
+        "/add - Add new store (admin)\n"
+        "/upload - Upload file (admin)\n\n"
+        "Just send a message to query!"
     )
 
 
-def fetch_notebook_info(url: str) -> dict:
-    """Fetch notebook name and description from NotebookLM page."""
-    try:
-        result = subprocess.run(
-            [
-                str(SKILL_PYTHON),
-                "-c",
-                f'''
-import sys
-import json
-import time
-sys.path.insert(0, str({repr(str(SCRIPTS_PATH))}))
-from patchright.sync_api import sync_playwright
-from browser_utils import BrowserFactory
-
-with sync_playwright() as playwright:
-    context = BrowserFactory.launch_persistent_context(playwright, headless=True)
-    page = context.pages[0] if context.pages else context.new_page()
-
-    try:
-        page.goto("{url}", wait_until="domcontentloaded", timeout=30000)
-        time.sleep(3)
-
-        # Extract notebook name from title or header
-        name = ""
-        name_selectors = [
-            'input[aria-label*="title"]',
-            '.notebook-title',
-            'h1',
-            '[data-notebook-title]',
-        ]
-        for sel in name_selectors:
-            try:
-                el = page.query_selector(sel)
-                if el:
-                    val = el.get_attribute("value") or el.inner_text()
-                    if val and val.strip():
-                        name = val.strip()
-                        break
-            except:
-                pass
-
-        if not name:
-            # Fallback to page title
-            title = page.title()
-            if title and "NotebookLM" in title:
-                name = title.replace(" - NotebookLM", "").strip()
-            else:
-                name = title or "Untitled"
-
-        # Extract description from sources
-        description = ""
-        desc_selectors = [
-            '.source-card .source-title',
-            '.sources-list .source-name',
-            '[data-source-title]',
-        ]
-        sources = []
-        for sel in desc_selectors:
-            try:
-                elements = page.query_selector_all(sel)
-                for el in elements:
-                    text = el.inner_text().strip()
-                    if text and text not in sources:
-                        sources.append(text)
-            except:
-                pass
-
-        if sources:
-            description = "Sources: " + ", ".join(sources[:5])
-
-        print(json.dumps({{"name": name, "description": description}}))
-    finally:
-        context.close()
-'''
-            ],
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            timeout=60,
-            cwd=str(SKILL_PATH),
-            env={"PYTHONIOENCODING": "utf-8", **os.environ},
-        )
-
-        if result.returncode == 0 and result.stdout.strip():
-            # Find JSON in output
-            for line in result.stdout.strip().split('\n'):
-                line = line.strip()
-                if line.startswith('{'):
-                    return json.loads(line)
-
-        return {"name": "", "description": ""}
-    except Exception as e:
-        logger.error(f"Error fetching notebook info: {e}")
-        return {"name": "", "description": ""}
-
-
-async def add_notebook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /add command - add notebook to library (admin only)"""
+async def add_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /add command - create new store (admin only)"""
     user_id = update.effective_user.id
 
     if not check_user_allowed(user_id):
         await update.message.reply_text("Access denied.")
         return
 
-    # Check if user is admin
     if not is_admin(user_id):
-        await update.message.reply_text("Only admin can add notebooks.")
+        await update.message.reply_text("Only admin can add stores.")
         return
 
-    # Get URL from command arguments
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    # Parse: /add <name> | <description>
     message_text = update.message.text
     args_text = re.sub(r'^/add\s*', '', message_text, flags=re.IGNORECASE).strip()
 
     if not args_text:
         await update.message.reply_text(
-            "Usage: /add <notebook_url>\n\n"
+            "Usage: /add <name> | <description>\n\n"
             "Example:\n"
-            "/add https://notebooklm.google.com/notebook/8b1d2368-449b-4bfc-abfa-5465b3a27981"
+            "/add My Project | Documentation and guides for my project"
         )
         return
 
-    url = args_text.split()[0]
+    parts = args_text.split("|", 1)
+    name = parts[0].strip()
+    description = parts[1].strip() if len(parts) > 1 else ""
 
-    # Validate URL and extract ID
-    notebook_id = extract_notebook_id(url)
-    if not notebook_id:
-        await update.message.reply_text(
-            "Invalid NotebookLM URL.\n"
-            "Expected format: https://notebooklm.google.com/notebook/{id}"
-        )
+    if not name:
+        await update.message.reply_text("Please provide a store name.")
         return
 
-    # Store URL and start the add flow - ask for name
-    context.user_data["pending_add"] = {
-        "url": url,
-        "id": notebook_id,
-        "step": "waiting_name"
-    }
+    status_msg = await update.message.reply_text(f"Creating store '{name}'...")
 
-    await update.message.reply_text(
-        f"Notebook ID: {notebook_id}\n\n"
-        "Enter notebook name:"
-    )
+    result = gemini_client.create_store(name, description)
 
+    if result:
+        if router:
+            router.reload_library()
 
-async def handle_pending_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle step-by-step notebook addition flow"""
-    pending = context.user_data.get("pending_add")
-    if not pending:
-        return False
-
-    text = update.message.text.strip()
-    step = pending.get("step")
-
-    # Step 1: Waiting for name
-    if step == "waiting_name":
-        pending["name"] = text
-        pending["step"] = "waiting_description"
-        context.user_data["pending_add"] = pending
-
-        await update.message.reply_text(
-            f"Name: {text}\n\n"
-            "Now enter notebook description:"
+        await status_msg.edit_text(
+            f"Store created!\n\n"
+            f"Name: {result['name']}\n"
+            f"ID: {result['id']}\n\n"
+            f"Now upload files with:\n"
+            f"/upload {name} (and attach a file)"
         )
-        return True
+    else:
+        await status_msg.edit_text("Failed to create store. Check logs.")
 
-    # Step 2: Waiting for description
-    if step == "waiting_description":
-        description = text
 
-        # Add notebook to file
-        success, message = add_notebook_to_file(
-            NOTEBOOKS_FILE,
-            pending["url"],
-            pending["name"],
-            description
+async def upload_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /upload command - upload file to store (admin only)"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not is_admin(user_id):
+        await update.message.reply_text("Only admin can upload files.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    document = update.message.document
+    if not document:
+        args_text = re.sub(r'^/upload\s*', '', update.message.text, flags=re.IGNORECASE).strip()
+        if args_text:
+            context.user_data["upload_store"] = args_text
+            await update.message.reply_text(
+                f"Ready to upload to '{args_text}'.\n"
+                f"Now send a file (PDF, TXT, DOCX, etc.)"
+            )
+        else:
+            await update.message.reply_text(
+                "Usage: /upload <store_name>\n"
+                "Then send a file.\n\n"
+                "Or reply to a file with /upload <store_name>"
+            )
+        return
+
+    args_text = re.sub(r'^/upload\s*', '', update.message.text, flags=re.IGNORECASE).strip()
+    store_name = args_text or context.user_data.get("upload_store")
+
+    if not store_name:
+        await update.message.reply_text("Please specify store name: /upload <store_name>")
+        return
+
+    store = gemini_client.get_store_by_name(store_name)
+    if not store:
+        await update.message.reply_text(f"Store not found: {store_name}")
+        return
+
+    status_msg = await update.message.reply_text(f"Downloading file...")
+
+    try:
+        file = await document.get_file()
+        temp_path = Path(f"/tmp/{document.file_name}")
+        await file.download_to_drive(temp_path)
+
+        await status_msg.edit_text(f"Uploading to '{store_name}'...")
+
+        success = gemini_client.upload_file(
+            store["id"],
+            temp_path,
+            document.file_name
         )
 
-        # Clear pending
-        del context.user_data["pending_add"]
+        temp_path.unlink(missing_ok=True)
+        context.user_data.pop("upload_store", None)
 
         if success:
-            # Reload router library
-            if router:
-                router.reload_library()
+            await status_msg.edit_text(
+                f"File uploaded!\n\n"
+                f"Store: {store_name}\n"
+                f"File: {document.file_name}\n\n"
+                f"You can now ask questions about this document."
+            )
+        else:
+            await status_msg.edit_text("Failed to upload. Check logs.")
 
-        await update.message.reply_text(message)
-        return True
+    except Exception as e:
+        logger.exception("Upload error")
+        await status_msg.edit_text(f"Error: {str(e)[:200]}")
 
-    return False
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle file uploads (for pending /upload command)"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id) or not is_admin(user_id):
+        return
+
+    store_name = context.user_data.get("upload_store")
+    if not store_name:
+        return
+
+    update.message.text = f"/upload {store_name}"
+    await upload_file(update, context)
 
 
-async def list_notebooks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /list command - show all notebooks"""
+async def list_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /list command - show all stores"""
     if not check_user_allowed(update.effective_user.id):
         await update.message.reply_text("Access denied.")
         return
 
-    notebooks = get_all_notebooks(NOTEBOOKS_FILE)
-
-    if not notebooks:
-        await update.message.reply_text("No notebooks yet.\nAdmin can add with /add command.")
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
         return
 
-    # Simple numbered list of names with descriptions
-    text = f"Notebooks ({len(notebooks)}):\n\n"
-    for i, nb in enumerate(notebooks, 1):
-        name = nb.get("name", "Unnamed")
-        desc = nb.get("description", "")
+    stores = gemini_client.list_stores()
+
+    if not stores:
+        await update.message.reply_text(
+            "No stores yet.\n"
+            "Admin can create with /add command."
+        )
+        return
+
+    text = f"Knowledge Stores ({len(stores)}):\n\n"
+    for i, store in enumerate(stores, 1):
+        name = store.get("name", "Unnamed")
+        desc = store.get("description", "")
+        docs = len(store.get("documents", []))
         text += f"{i}. {name}\n"
         if desc:
             text += f"   {desc[:50]}{'...' if len(desc) > 50 else ''}\n"
+        text += f"   Documents: {docs}\n\n"
 
     await update.message.reply_text(text)
-
-
-async def reload_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /reload command"""
-    if not check_user_allowed(update.effective_user.id):
-        await update.message.reply_text("Access denied.")
-        return
-
-    if router:
-        router.reload_library()
-        await update.message.reply_text(f"Library reloaded. {len(router.notebooks)} notebooks.")
-    else:
-        await update.message.reply_text("Router not initialized.")
 
 
 async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -336,201 +288,139 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_lines = [
         "Status:",
-        f"- Smart routing: {'Yes' if router else 'No (no API key)'}",
-        f"- Notebooks loaded: {len(router.notebooks) if router else 0}",
-        f"- Skill path: {SKILL_PATH}",
+        f"- Gemini API: {'OK' if gemini_client else 'Not configured'}",
+        f"- Smart routing: {'OK' if router else 'Not configured'}",
+        f"- Stores: {len(gemini_client.stores) if gemini_client else 0}",
+        f"- Model: {GEMINI_MODEL}",
+        f"- Thinking level: {GEMINI_THINKING_LEVEL}",
+        "",
+        "Powered by Gemini 3 Flash"
     ]
-
-    # Check auth
-    try:
-        result = subprocess.run(
-            [str(SKILL_PYTHON), str(SCRIPTS_PATH / "auth_manager.py"), "status"],
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            timeout=30,
-            cwd=str(SKILL_PATH),
-            env={"PYTHONIOENCODING": "utf-8", **os.environ},
-        )
-        if "Yes" in result.stdout or "authenticated" in result.stdout.lower():
-            status_lines.append("- NotebookLM auth: OK")
-        else:
-            status_lines.append("- NotebookLM auth: Not authenticated")
-    except Exception as e:
-        status_lines.append(f"- NotebookLM auth: Error ({e})")
 
     await update.message.reply_text("\n".join(status_lines))
 
 
-async def sync_notebooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /sync command - sync notebooks from NotebookLM account"""
+async def sync_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /sync command - sync stores with API"""
     if not check_user_allowed(update.effective_user.id):
         await update.message.reply_text("Access denied.")
         return
 
-    status_msg = await update.message.reply_text(
-        "Syncing notebooks from your NotebookLM account...\n"
-        "Fetching descriptions from each notebook.\n"
-        "This may take 2-5 minutes depending on notebook count."
-    )
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    status_msg = await update.message.reply_text("Syncing stores with API...")
 
     try:
-        # Run sync script (visible for better reliability)
-        result = subprocess.run(
-            [str(SKILL_PYTHON), str(SCRIPTS_PATH / "sync_notebooks.py"), "--visible"],
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            timeout=600,  # 10 min max
-            cwd=str(SKILL_PATH),
-            env={"PYTHONIOENCODING": "utf-8", **os.environ},
-        )
-
-        output = result.stdout + result.stderr
-
-        # Count notebooks found
-        import re
-        found_match = re.search(r'Total notebooks synced: (\d+)', output)
-        added_match = re.search(r'Added (\d+) new notebooks', output)
-        updated_match = re.search(r'updated (\d+) descriptions', output)
-
-        found = int(found_match.group(1)) if found_match else 0
-        added = int(added_match.group(1)) if added_match else 0
-        updated = int(updated_match.group(1)) if updated_match else 0
-
-        if found == 0:
-            await status_msg.edit_text(
-                "No notebooks found.\n"
-                "Make sure you're authenticated (run /status to check)."
-            )
-            return
-
-        # Check how many have descriptions
-        library_path = SKILL_PATH / "data" / "library.json"
-        missing_desc = 0
-        if library_path.exists():
-            with open(library_path, "r", encoding="utf-8") as f:
-                lib = json.load(f)
-                for nb in lib.get("notebooks", []):
-                    if not nb.get("description"):
-                        missing_desc += 1
-
-        # Generate descriptions via GPT only for those without
-        if missing_desc > 0 and ANTHROPIC_API_KEY:
-            await status_msg.edit_text(
-                f"Found {found} notebooks.\n"
-                f"Generating descriptions for {missing_desc} without them..."
-            )
-            descriptions_added = generate_descriptions(ANTHROPIC_API_KEY, library_path)
-        else:
-            descriptions_added = 0
-
-        # Reload router
+        gemini_client.sync_with_api()
         if router:
             router.reload_library()
 
         await status_msg.edit_text(
             f"Sync complete!\n"
-            f"- Notebooks: {found}\n"
-            f"- New: {added}\n"
-            f"- Descriptions from NotebookLM: {found - missing_desc}\n"
-            f"- Descriptions via GPT: {descriptions_added}\n\n"
-            f"Use /list to see all notebooks."
+            f"Total stores: {len(gemini_client.stores)}"
         )
-
-    except subprocess.TimeoutExpired:
-        await status_msg.edit_text("Sync timed out. Try /sync again or use fewer notebooks.")
     except Exception as e:
-        logger.exception("Sync error")
-        await status_msg.edit_text(f"Error: {str(e)[:500]}")
+        await status_msg.edit_text(f"Sync error: {str(e)[:200]}")
 
 
-def query_notebook_sync(url: str, question: str) -> dict:
-    """
-    Query a single notebook (sync, for thread pool).
+async def delete_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /delete command - delete a store (admin only)"""
+    user_id = update.effective_user.id
 
-    Returns dict with 'url', 'answer', 'error'
-    """
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not is_admin(user_id):
+        await update.message.reply_text("Only admin can delete stores.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    args_text = re.sub(r'^/delete\s*', '', update.message.text, flags=re.IGNORECASE).strip()
+
+    if not args_text:
+        await update.message.reply_text("Usage: /delete <store_name>")
+        return
+
+    store = gemini_client.get_store_by_name(args_text)
+    if not store:
+        await update.message.reply_text(f"Store not found: {args_text}")
+        return
+
+    if gemini_client.delete_store(store["id"]):
+        if router:
+            router.reload_library()
+        await update.message.reply_text(f"Deleted: {args_text}")
+    else:
+        await update.message.reply_text("Failed to delete. Check logs.")
+
+
+async def handle_think(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /think command - answer with thinking mode"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    args_text = re.sub(r'^/think\s*', '', update.message.text, flags=re.IGNORECASE).strip()
+
+    if not args_text:
+        await update.message.reply_text(
+            "Usage: /think <question>\n\n"
+            "Uses Gemini thinking mode for complex reasoning."
+        )
+        return
+
+    if not gemini_client.stores:
+        await update.message.reply_text("No knowledge stores available.")
+        return
+
+    await update.message.chat.send_action("typing")
+    status_msg = await update.message.reply_text("Thinking deeply...")
+
     try:
-        result = subprocess.run(
-            [
-                str(SKILL_PYTHON),
-                str(SCRIPTS_PATH / "ask_question.py"),
-                "--notebook-url", url,
-                "--question", question,
-                "--show-browser",
-            ],
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            timeout=QUERY_TIMEOUT,
-            cwd=str(SKILL_PATH),
-            env={"PYTHONIOENCODING": "utf-8", **os.environ},
+        # Route the question
+        if router and len(gemini_client.stores) > 1:
+            selected, reasoning = router.route_with_reasoning(args_text, max_notebooks=1)
+            store = selected[0] if selected else gemini_client.stores[0]
+        else:
+            store = gemini_client.stores[0]
+
+        await status_msg.edit_text(f"Thinking about: {store.get('name')}...")
+
+        # Get answer with high thinking level
+        answer, thinking = gemini_client.ask_with_thinking(
+            store["id"],
+            args_text,
+            thinking_level="high"
         )
 
-        if result.returncode != 0:
-            return {"url": url, "answer": None, "error": result.stderr[:500]}
+        if answer:
+            response_text = f"Store: {store.get('name')}\n\n{answer}"
 
-        answer = extract_answer(result.stdout)
-        return {"url": url, "answer": answer, "error": None}
+            if len(response_text) > 4000:
+                parts = [response_text[i:i+4000] for i in range(0, len(response_text), 4000)]
+                await status_msg.edit_text(parts[0])
+                for part in parts[1:]:
+                    await update.message.reply_text(part)
+            else:
+                await status_msg.edit_text(response_text)
+        else:
+            await status_msg.edit_text("No answer received from thinking mode.")
 
-    except subprocess.TimeoutExpired:
-        return {"url": url, "answer": None, "error": "Timeout"}
     except Exception as e:
-        return {"url": url, "answer": None, "error": str(e)}
-
-
-def extract_answer(output: str) -> str:
-    """Extract clean answer from ask_question.py output"""
-    lines = output.split("\n")
-    answer_lines = []
-    in_answer = False
-
-    for line in lines:
-        # Skip status/progress lines
-        if any(x in line for x in [
-            "🔐", "✅", "❌", "⏳", "💾", "🔍", "🌐", "📚", "💬",
-            "Opening", "Waiting", "Found input", "Typing", "Submitting",
-            "Got answer", "===", "---", "Asking:"
-        ]):
-            continue
-
-        # Start capturing after "Question:" line
-        if line.strip().startswith("Question:"):
-            in_answer = True
-            continue
-
-        # Stop at "EXTREMELY IMPORTANT" footer
-        if "EXTREMELY IMPORTANT" in line:
-            break
-
-        if in_answer and line.strip():
-            answer_lines.append(line)
-
-    # Join and clean up
-    answer = "\n".join(answer_lines).strip()
-
-    # Remove any trailing "EXTREMELY IMPORTANT..." text that might have been included
-    if "EXTREMELY IMPORTANT" in answer:
-        answer = answer.split("EXTREMELY IMPORTANT")[0].strip()
-
-    # If no answer found, try to get any meaningful text
-    if not answer:
-        meaningful = [
-            l.strip() for l in lines
-            if l.strip()
-            and not any(x in l for x in [
-                "🔐", "✅", "❌", "⏳", "💾", "🔍", "🌐", "📚", "💬",
-                "Opening", "Waiting", "Found", "Typing", "Submitting",
-                "===", "---", "Question:", "EXTREMELY IMPORTANT"
-            ])
-        ]
-        answer = "\n".join(meaningful)
-
-    return answer
+        logger.exception("Error in thinking mode")
+        await status_msg.edit_text(f"Error: {str(e)[:500]}")
 
 
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -541,156 +431,67 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Access denied.")
         return
 
-    # Check if this is part of pending /add flow
-    if await handle_pending_add(update, context):
-        return
-
     question = update.message.text.strip()
     if not question:
         return
 
-    # Check if we have notebooks
-    if router and not router.notebooks:
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    if not gemini_client.stores:
         await update.message.reply_text(
-            "No notebooks in library.\n"
-            "Use /add to add notebooks first."
+            "No knowledge stores available.\n"
+            "Admin can create with /add command."
         )
         return
 
-    if not router:
-        await update.message.reply_text(
-            "Smart routing not available (no API key).\n"
-            "Set ANTHROPIC_API_KEY in .env"
-        )
-        return
-
-    # Send typing indicator
     await update.message.chat.send_action("typing")
 
-    # Route the question
     status_msg = await update.message.reply_text("Analyzing question...")
 
     try:
-        selected, reasoning = router.route_with_reasoning(question, max_notebooks=3)
+        # Route the question
+        if router and len(gemini_client.stores) > 1:
+            selected, reasoning = router.route_with_reasoning(question, max_notebooks=1)
+            if selected:
+                store = selected[0]
+                await status_msg.edit_text(
+                    f"Selected: {store.get('name')}\n"
+                    f"Reason: {reasoning}\n\n"
+                    f"Getting answer..."
+                )
+            else:
+                store = gemini_client.stores[0]
+                await status_msg.edit_text(f"Querying {store.get('name')}...")
+        else:
+            store = gemini_client.stores[0]
+            await status_msg.edit_text(f"Querying {store.get('name')}...")
 
-        if not selected:
-            await status_msg.edit_text("Could not find relevant notebooks.")
-            return
-
-        # Show routing decision
-        notebook_names = [nb.get("name", "?") for nb in selected]
-        await status_msg.edit_text(
-            f"Selected: {', '.join(notebook_names)}\n"
-            f"Reason: {reasoning}\n\n"
-            f"Querying {len(selected)} notebook(s)..."
+        # Get answer from Gemini
+        answer = gemini_client.ask_question(
+            store["id"],
+            question,
+            model=GEMINI_MODEL
         )
 
-        # Query notebooks sequentially (to avoid browser profile conflicts)
-        loop = asyncio.get_event_loop()
-        answers = []
-
-        for nb in selected:
-            nb_name = nb.get("name", "Unknown")
-            nb_url = nb.get("url")
-
-            # Enhance the prompt for this specific notebook
-            enhanced_question = router.enhance_prompt(question, nb)
-            
-            await status_msg.edit_text(
-                f"📚 Querying: {nb_name}...\n"
-                f"💬 Enhanced: {enhanced_question[:100]}..."
-            )
-
-            result = await loop.run_in_executor(
-                executor,
-                query_notebook_sync,
-                nb_url,
-                enhanced_question  # Use enhanced question
-            )
-
-            if result["answer"]:
-                answers.append({
-                    "notebook": nb_name,
-                    "answer": result["answer"]
-                })
-                # Got an answer - stop querying more notebooks
-                break
-            elif result["error"]:
-                logger.warning(f"Query error for {nb_name}: {result['error']}")
-
-        if not answers:
-            await status_msg.edit_text(
-                f"Selected: {', '.join(notebook_names)}\n\n"
-                "No answers received. Notebooks may be unavailable."
-            )
-            return
-
-        # Format response - just the answer, clean and simple
-        if len(answers) == 1:
-            response = answers[0]['answer']
+        if answer:
+            if len(answer) > 4000:
+                parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
+                await status_msg.edit_text(parts[0])
+                for part in parts[1:]:
+                    await update.message.reply_text(part)
+            else:
+                await status_msg.edit_text(answer)
         else:
-            # Multiple answers - add source headers
-            response = ""
-            for ans in answers:
-                response += f"[{ans['notebook']}]\n{ans['answer']}\n\n"
-            response = response.strip()
-
-        # Split long messages
-        if len(response) > 4000:
-            parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
-            await status_msg.edit_text(parts[0])
-            for part in parts[1:]:
-                await update.message.reply_text(part)
-        else:
-            await status_msg.edit_text(response)
+            await status_msg.edit_text(
+                "No answer received.\n"
+                "The store might be empty or the question couldn't be answered."
+            )
 
     except Exception as e:
         logger.exception("Error handling question")
         await status_msg.edit_text(f"Error: {str(e)[:500]}")
-
-
-
-
-async def background_sync(context: ContextTypes.DEFAULT_TYPE):
-    """Background job to sync notebooks periodically"""
-    logger.info("Running background sync...")
-
-    try:
-        # Run quick sync (no descriptions, just list)
-        result = subprocess.run(
-            [str(SKILL_PYTHON), str(SCRIPTS_PATH / "sync_notebooks.py"),
-             "--headless", "--no-descriptions"],
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            timeout=120,
-            cwd=str(SKILL_PATH),
-            env={"PYTHONIOENCODING": "utf-8", **os.environ},
-        )
-
-        # Reload router
-        if router:
-            router.reload_library()
-            logger.info(f"Background sync complete. {len(router.notebooks)} notebooks.")
-
-    except Exception as e:
-        logger.error(f"Background sync error: {e}")
-
-
-async def startup_sync(app):
-    """Run quick sync on bot startup (just reload existing library, don't re-fetch)"""
-    logger.info("Running startup sync...")
-
-    try:
-        # Just reload existing library on startup (fast)
-        # Full sync happens every 30 min via background_sync
-        if router:
-            router.reload_library()
-            logger.info(f"Startup sync complete. {len(router.notebooks)} notebooks loaded.")
-
-    except Exception as e:
-        logger.error(f"Startup sync error: {e}")
 
 
 def main():
@@ -699,49 +500,36 @@ def main():
         print("Error: BOT_TOKEN not set in .env file")
         sys.exit(1)
 
-    if not SKILL_PATH.exists():
-        print(f"Error: NotebookLM skill not found at {SKILL_PATH}")
+    if not GEMINI_API_KEY:
+        print("Error: GEMINI_API_KEY not set in .env file")
+        print("Get your API key from: https://aistudio.google.com/app/apikey")
         sys.exit(1)
 
-    if not SKILL_PYTHON.exists():
-        print(f"Error: Python venv not found at {SKILL_PYTHON}")
-        print("Run setup in notebooklm-skill first")
-        sys.exit(1)
+    print("Starting Gemini 3 Flash Bot...")
+    print(f"Stores: {len(gemini_client.stores) if gemini_client else 0}")
+    print(f"Routing: {'enabled' if router else 'disabled'}")
+    print(f"Model: {GEMINI_MODEL}")
+    print(f"Thinking level: {GEMINI_THINKING_LEVEL}")
+    print("Powered by Gemini 3 Flash")
 
-    if not ANTHROPIC_API_KEY:
-        print("Warning: ANTHROPIC_API_KEY not set - smart routing disabled")
-
-    print("Starting NotebookLM Router Bot...")
-    print(f"Skill path: {SKILL_PATH}")
-    print(f"Smart routing: {'enabled' if router else 'disabled'}")
-    if router:
-        print(f"Notebooks loaded: {len(router.notebooks)}")
-
-    # Create application
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
-    app.add_handler(CommandHandler("add", add_notebook))
-    app.add_handler(CommandHandler("list", list_notebooks_cmd))
-    app.add_handler(CommandHandler("reload", reload_library))
+    app.add_handler(CommandHandler("add", add_store))
+    app.add_handler(CommandHandler("upload", upload_file))
+    app.add_handler(CommandHandler("list", list_stores))
     app.add_handler(CommandHandler("status", check_status))
-    app.add_handler(CommandHandler("sync", sync_notebooks))
+    app.add_handler(CommandHandler("sync", sync_stores))
+    app.add_handler(CommandHandler("delete", delete_store))
+    app.add_handler(CommandHandler("think", handle_think))
+
+    # File handler (for /upload flow)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+
+    # Question handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question))
-
-    # Schedule background sync
-    if AUTO_SYNC_INTERVAL > 0:
-        print(f"Auto-sync enabled: every {AUTO_SYNC_INTERVAL} minutes")
-        app.job_queue.run_repeating(
-            background_sync,
-            interval=AUTO_SYNC_INTERVAL * 60,  # Convert to seconds
-            first=AUTO_SYNC_INTERVAL * 60,  # First run after interval
-            name="background_sync"
-        )
-
-    # Run startup sync
-    app.post_init = startup_sync
 
     # Start polling
     print("Bot is running! Press Ctrl+C to stop.")
