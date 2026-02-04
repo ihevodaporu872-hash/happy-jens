@@ -21,6 +21,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # Admin user ID - only admin can add/remove stores
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0")) if os.getenv("ADMIN_USER_ID") else None
 
+# Notification channel ID - for team notifications about important events
+# Get channel ID by forwarding a message from channel to @userinfobot
+NOTIFICATION_CHANNEL_ID = int(os.getenv("NOTIFICATION_CHANNEL_ID", "0")) if os.getenv("NOTIFICATION_CHANNEL_ID") else None
+
 # Stores JSON file path
 STORES_FILE = Path(__file__).parent / "stores.json"
 

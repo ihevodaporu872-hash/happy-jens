@@ -167,39 +167,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         drive_status = "enabled (public URLs only)"
 
+    notification_status = "enabled" if NOTIFICATION_CHANNEL_ID else "disabled"
+
     await update.message.reply_text(
-        f"Gemini 3 Flash Bot{admin_note}\n\n"
+        f"Happy-Jens Tender Bot{admin_note}\n\n"
         f"Model: {GEMINI_MODEL}\n"
         f"File Search: {gemini_status}\n"
         f"Smart routing: {routing_status}\n"
         f"Google Drive: {drive_status}\n"
+        f"Notifications: {notification_status}\n"
         f"Stores: {stores_count}\n\n"
-        "Commands (aliases):\n"
-        "/list or /stores - Show all stores\n"
-        "/select <store> - Select active store\n"
-        "/status - Check status\n"
-        "/think <question> - Deep thinking mode\n"
-        "/clear - Clear conversation history\n"
-        "/compare <s1> <s2> <topic> - Compare stores\n"
-        "/export - Export last answer to PDF/DOCX\n"
-        "/add or /addstore - Add new store (admin)\n"
-        "/delete or /deletestore - Delete store (admin)\n"
-        "/rename <old> | <new> - Rename store (admin)\n"
-        "/upload - Upload file (admin)\n"
-        "/uploadurl - Upload from Google URL (admin)\n"
-        "/setsync - Configure auto-sync URLs (admin)\n"
-        "/syncnow - Force sync now (admin)\n\n"
-        "Send:\n"
-        "- Text message to query stores\n"
-        "- Google Drive folder link to auto-create store (admin)\n"
-        "- Photo to analyze (add caption for custom prompt)\n"
-        "- Voice message to ask questions\n\n"
-        "You can also use natural language, e.g.:\n"
-        "- \"Покажи список тендеров\"\n"
-        "- \"Выбери тендер Дубровка\"\n"
-        "- \"Сделай экспорт в PDF\"\n\n"
-        "Bot remembers last 5 messages per store for context.\n"
-        "Use PDF/DOCX buttons under answers to export."
+        "📋 Анализ тендеров:\n"
+        "/summary [store] - Executive Summary тендера\n"
+        "/generate_rfi [store] [тема] - RFI письмо\n"
+        "/norm <СП/ГОСТ> [store] - Поиск норматива\n\n"
+        "📁 Управление:\n"
+        "/list or /stores - Список тендеров\n"
+        "/select <store> - Выбрать тендер\n"
+        "/status - Статус бота\n"
+        "/clear - Очистить историю\n\n"
+        "🔍 Поиск и сравнение:\n"
+        "/think <question> - Глубокий анализ\n"
+        "/compare <s1> <s2> <topic> - Сравнить\n"
+        "/export - Экспорт в PDF/DOCX\n\n"
+        "⚙️ Админ:\n"
+        "/add, /delete, /rename - Управление stores\n"
+        "/upload, /uploadurl - Загрузка файлов\n"
+        "/setsync, /syncnow - Синхронизация\n\n"
+        "Также можно:\n"
+        "• Отправить текст для поиска\n"
+        "• Ссылку на Google Drive папку\n"
+        "• Фото или голосовое\n\n"
+        "Бот помнит последние 5 сообщений."
     )
 
 
@@ -1992,6 +1991,486 @@ async def _send_answer(status_msg, update, answer, context, question, store_name
             )
 
 
+async def send_notification(context: ContextTypes.DEFAULT_TYPE, message: str, parse_mode: str = None):
+    """
+    Send notification to the team channel if configured.
+
+    Args:
+        context: Telegram context
+        message: Message text to send
+        parse_mode: Optional parse mode (HTML, Markdown)
+    """
+    if not NOTIFICATION_CHANNEL_ID:
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=NOTIFICATION_CHANNEL_ID,
+            text=message,
+            parse_mode=parse_mode
+        )
+        logger.info(f"Notification sent to channel {NOTIFICATION_CHANNEL_ID}")
+    except Exception as e:
+        logger.error(f"Failed to send notification: {e}")
+
+
+async def handle_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /summary command - generate executive summary of a tender"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    if not gemini_client.stores:
+        await update.message.reply_text(
+            "No knowledge stores available.\n"
+            "Admin can create with /add command."
+        )
+        return
+
+    # Get store from args or selected store
+    args_text = re.sub(r'^/summary\s*', '', update.message.text, flags=re.IGNORECASE).strip()
+
+    store = None
+    if args_text:
+        store = gemini_client.find_store_by_name(args_text)
+        if not store:
+            await update.message.reply_text(f"Store not found: {args_text}")
+            return
+    else:
+        store = _get_selected_store_for_user(user_id)
+        if not store:
+            await update.message.reply_text(
+                "Usage: /summary [store_name]\n\n"
+                "Or select a store first with /select command."
+            )
+            return
+
+    await update.message.chat.send_action("typing")
+    status_msg = await update.message.reply_text(
+        f"Генерирую саммари для {store.get('name')}...\n"
+        "Это может занять некоторое время."
+    )
+
+    try:
+        # Load summary prompt from library
+        summary_prompt = """Роль: эксперт тендерного отдела генподрядчика (Москва). Проанализируй ВСЮ загруженную документацию по тендеру и составь Executive Summary на 1 страницу.
+
+СТРУКТУРА САММАРИ:
+
+1. **ОБЪЕКТ**
+   - Название проекта
+   - Тип объекта (жилой, коммерческий, промышленный)
+   - Адрес/местоположение
+   - Площадь/этажность/основные параметры
+
+2. **ЗАКАЗЧИК**
+   - Наименование организации
+   - Контактные данные (если есть)
+   - Тип заказчика (застройщик, генподрядчик, госзаказ)
+
+3. **ОБЪЁМЫ РАБОТ**
+   - Основные виды работ
+   - Ключевые объёмы (м², м³, т)
+   - Особые требования к материалам
+
+4. **СРОКИ**
+   - Дата подачи КП
+   - Плановое начало работ
+   - Срок завершения
+   - Ключевые этапы
+
+5. **СТОИМОСТЬ** (если указана)
+   - НМЦ или ориентировочная стоимость
+   - Условия оплаты
+   - Обеспечение контракта
+
+6. **КЛЮЧЕВЫЕ РИСКИ** (топ-5)
+   - Технические риски
+   - Коммерческие риски
+   - Сроковые риски
+
+7. **РЕКОМЕНДАЦИЯ**
+   - Участвовать / Не участвовать / Требуется уточнение
+   - Краткое обоснование
+
+Для каждого пункта указывай источник (документ, раздел/страница). Если информация отсутствует — укажи 'Не указано в документации'."""
+
+        # Use Pro model for complex analysis
+        answer = gemini_client.ask_question(
+            store["id"],
+            summary_prompt,
+            model=GEMINI_MODEL_PRO
+        )
+
+        if answer:
+            # Save for export
+            context.user_data["last_response"] = {
+                "question": "Executive Summary тендера",
+                "answer": answer,
+                "store": store.get("name", ""),
+                "timestamp": datetime.now().isoformat()
+            }
+
+            # Send notification to channel
+            if NOTIFICATION_CHANNEL_ID:
+                user_name = update.effective_user.full_name or update.effective_user.username
+                await send_notification(
+                    context,
+                    f"📋 Сгенерировано саммари тендера\n"
+                    f"Тендер: {store.get('name')}\n"
+                    f"Пользователь: {user_name}",
+                )
+
+            if len(answer) > 4000:
+                parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
+                await status_msg.edit_text(parts[0])
+                for part in parts[1:]:
+                    await update.message.reply_text(part)
+                await update.message.reply_text("Export:", reply_markup=get_export_keyboard())
+            else:
+                await status_msg.edit_text(answer, reply_markup=get_export_keyboard())
+        else:
+            await status_msg.edit_text(
+                "Не удалось сгенерировать саммари.\n"
+                "Возможно, в store недостаточно документов."
+            )
+
+    except Exception as e:
+        logger.exception("Error in summary")
+        await status_msg.edit_text(f"Error: {str(e)[:500]}")
+
+
+async def handle_generate_rfi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /generate_rfi command - generate RFI letter to customer"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    if not gemini_client.stores:
+        await update.message.reply_text(
+            "No knowledge stores available.\n"
+            "Admin can create with /add command."
+        )
+        return
+
+    # Parse: /generate_rfi [store_name] [topic]
+    args_text = re.sub(r'^/generate_rfi\s*', '', update.message.text, flags=re.IGNORECASE).strip()
+
+    store = None
+    topic = ""
+
+    if args_text:
+        # Try to parse store name and topic
+        parts = args_text.split(None, 1)
+        store_candidate = parts[0]
+        store = gemini_client.find_store_by_name(store_candidate)
+
+        if store and len(parts) > 1:
+            topic = parts[1]
+        elif not store:
+            # Maybe the whole text is a topic, use selected store
+            store = _get_selected_store_for_user(user_id)
+            topic = args_text
+    else:
+        store = _get_selected_store_for_user(user_id)
+
+    if not store:
+        await update.message.reply_text(
+            "Usage: /generate_rfi [store_name] [topic]\n\n"
+            "Examples:\n"
+            "/generate_rfi МайПриорити\n"
+            "/generate_rfi МайПриорити водопонижение\n"
+            "/generate_rfi  (uses selected store)\n\n"
+            "Or select a store first with /select command."
+        )
+        return
+
+    await update.message.chat.send_action("typing")
+    status_msg = await update.message.reply_text(
+        f"Генерирую RFI письмо для {store.get('name')}...\n"
+        f"{'Тема: ' + topic if topic else 'Анализирую всю документацию...'}"
+    )
+
+    try:
+        # Build RFI prompt
+        rfi_prompt = f"""Роль: инженер ПТО генподрядчика, отвечающий за подготовку тендерной документации.
+
+ЗАДАЧА: Сформируй официальное письмо-запрос (RFI — Request for Information) заказчику.
+{f'ФОКУС: Сосредоточься на теме: {topic}' if topic else ''}
+
+АНАЛИЗ: Изучи загруженную документацию и выяви:
+1. Противоречия между документами
+2. Отсутствующую информацию
+3. Неоднозначные требования
+4. Вопросы по объёмам и срокам
+
+ФОРМАТ ПИСЬМА:
+
+---
+Исх. №______ от «__» _______ 2025 г.
+
+Генеральному директору
+[Наименование организации-заказчика]
+[ФИО]
+
+О запросе разъяснений по тендерной документации
+Объект: [Название объекта]
+
+Уважаемый [Имя Отчество]!
+
+В рамках подготовки коммерческого предложения по объекту [название] просим предоставить разъяснения по следующим вопросам:
+
+№ | Раздел документации | Вопрос | Ссылка на документ
+1 | [раздел] | [вопрос] | [документ, п.X / стр.Y]
+2 | ...
+
+Просим направить ответ в срок до [дата] для своевременной подготовки предложения.
+
+С уважением,
+[Должность]
+[ФИО]
+[Контакты]
+---
+
+ВАЖНО:
+- Вопросы отсортируй по приоритету: Критичные → Важные → Уточняющие
+- Для каждого вопроса укажи конкретную ссылку на документ
+- Формулируй вопросы чётко и однозначно
+- Количество вопросов: 5-15 (оптимально)"""
+
+        # Use Pro model for complex document analysis
+        answer = gemini_client.ask_question(
+            store["id"],
+            rfi_prompt,
+            model=GEMINI_MODEL_PRO
+        )
+
+        if answer:
+            # Save for export
+            context.user_data["last_response"] = {
+                "question": f"RFI письмо{' по теме: ' + topic if topic else ''}",
+                "answer": answer,
+                "store": store.get("name", ""),
+                "timestamp": datetime.now().isoformat()
+            }
+
+            # Send notification to channel
+            if NOTIFICATION_CHANNEL_ID:
+                user_name = update.effective_user.full_name or update.effective_user.username
+                await send_notification(
+                    context,
+                    f"📝 Сгенерировано RFI письмо\n"
+                    f"Тендер: {store.get('name')}\n"
+                    f"{'Тема: ' + topic if topic else ''}\n"
+                    f"Пользователь: {user_name}",
+                )
+
+            if len(answer) > 4000:
+                parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
+                await status_msg.edit_text(parts[0])
+                for part in parts[1:]:
+                    await update.message.reply_text(part)
+                await update.message.reply_text("Export:", reply_markup=get_export_keyboard())
+            else:
+                await status_msg.edit_text(answer, reply_markup=get_export_keyboard())
+        else:
+            await status_msg.edit_text(
+                "Не удалось сгенерировать RFI письмо.\n"
+                "Возможно, в store недостаточно документов."
+            )
+
+    except Exception as e:
+        logger.exception("Error in generate_rfi")
+        await status_msg.edit_text(f"Error: {str(e)[:500]}")
+
+
+async def handle_norm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /norm command - search for regulatory document mentions"""
+    user_id = update.effective_user.id
+
+    if not check_user_allowed(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    if not gemini_client:
+        await update.message.reply_text("Gemini API not configured.")
+        return
+
+    if not gemini_client.stores:
+        await update.message.reply_text(
+            "No knowledge stores available.\n"
+            "Admin can create with /add command."
+        )
+        return
+
+    # Parse: /norm <norm_code> [store_name]
+    args_text = re.sub(r'^/norm\s*', '', update.message.text, flags=re.IGNORECASE).strip()
+
+    if not args_text:
+        await update.message.reply_text(
+            "Usage: /norm <код_норматива> [store_name]\n\n"
+            "Examples:\n"
+            "/norm СП 48.13330\n"
+            "/norm ГОСТ 27751-2014\n"
+            "/norm СНиП 3.02.01-87 МайПриорити\n\n"
+            "Without store name, searches in selected store or all stores."
+        )
+        return
+
+    # Try to extract norm code and optional store name
+    parts = args_text.rsplit(None, 1)
+    norm_code = args_text
+    store = None
+
+    if len(parts) > 1:
+        # Check if last part is a store name
+        potential_store = gemini_client.find_store_by_name(parts[1])
+        if potential_store:
+            store = potential_store
+            norm_code = parts[0]
+
+    if not store:
+        store = _get_selected_store_for_user(user_id)
+
+    await update.message.chat.send_action("typing")
+
+    # If no store selected, search in all stores
+    if not store:
+        status_msg = await update.message.reply_text(
+            f"Поиск норматива '{norm_code}' во всех тендерах..."
+        )
+
+        # Search across all stores
+        results = []
+        for s in gemini_client.stores:
+            norm_prompt = f"""Найди ВСЕ упоминания норматива '{norm_code}' в документации.
+
+Для каждого упоминания укажи:
+1. Раздел/страница
+2. Контекст (2-3 предложения вокруг упоминания)
+3. Что требуется по этому нормативу
+
+Если норматив НЕ найден, ответь: 'Норматив {norm_code} не найден в документации.'"""
+
+            answer = gemini_client.ask_question(
+                s["id"],
+                norm_prompt,
+                model=GEMINI_MODEL_FLASH
+            )
+
+            if answer and "не найден" not in answer.lower():
+                results.append({
+                    "store": s.get("name"),
+                    "answer": answer
+                })
+
+        if results:
+            response_text = f"## Норматив: {norm_code}\n\n"
+            for r in results:
+                response_text += f"### 📁 {r['store']}\n{r['answer']}\n\n"
+
+            # Save for export
+            context.user_data["last_response"] = {
+                "question": f"Поиск норматива {norm_code}",
+                "answer": response_text,
+                "store": "multistore",
+                "timestamp": datetime.now().isoformat()
+            }
+
+            if len(response_text) > 4000:
+                parts = [response_text[i:i+4000] for i in range(0, len(response_text), 4000)]
+                await status_msg.edit_text(parts[0])
+                for part in parts[1:]:
+                    await update.message.reply_text(part)
+                await update.message.reply_text("Export:", reply_markup=get_export_keyboard())
+            else:
+                await status_msg.edit_text(response_text, reply_markup=get_export_keyboard())
+        else:
+            await status_msg.edit_text(
+                f"Норматив '{norm_code}' не найден ни в одном тендере."
+            )
+        return
+
+    # Search in specific store
+    status_msg = await update.message.reply_text(
+        f"Поиск норматива '{norm_code}' в {store.get('name')}..."
+    )
+
+    try:
+        norm_prompt = f"""Роль: инженер ПТО, проверяющий соответствие документации нормативным требованиям.
+
+ЗАДАЧА: Найди ВСЕ упоминания норматива '{norm_code}' в загруженной документации.
+
+ДЛЯ КАЖДОГО УПОМИНАНИЯ УКАЖИ:
+1. **Документ**: название файла
+2. **Раздел/страница**: где именно упоминается
+3. **Контекст**: цитата (2-3 предложения вокруг упоминания)
+4. **Требование**: что конкретно требуется по этому нормативу
+5. **Статус**: Выполнимо / Требует уточнения / Противоречит другим требованиям
+
+Если норматив НЕ найден:
+- Укажи это явно
+- Предложи, в каких разделах он ДОЛЖЕН быть упомянут
+- Отметь это как потенциальный риск
+
+ФОРМАТ ВЫВОДА:
+
+## Норматив: {norm_code}
+
+### Найдено упоминаний: X
+
+| № | Документ | Раздел | Контекст | Требование | Статус |
+|---|----------|--------|----------|------------|--------|
+| 1 | ... | ... | ... | ... | ... |
+
+### Выводы и рекомендации:
+- ..."""
+
+        answer = gemini_client.ask_question(
+            store["id"],
+            norm_prompt,
+            model=GEMINI_MODEL_FLASH
+        )
+
+        if answer:
+            # Save for export
+            context.user_data["last_response"] = {
+                "question": f"Поиск норматива {norm_code}",
+                "answer": answer,
+                "store": store.get("name", ""),
+                "timestamp": datetime.now().isoformat()
+            }
+
+            if len(answer) > 4000:
+                parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
+                await status_msg.edit_text(parts[0])
+                for part in parts[1:]:
+                    await update.message.reply_text(part)
+                await update.message.reply_text("Export:", reply_markup=get_export_keyboard())
+            else:
+                await status_msg.edit_text(answer, reply_markup=get_export_keyboard())
+        else:
+            await status_msg.edit_text(
+                f"Не удалось выполнить поиск норматива '{norm_code}'."
+            )
+
+    except Exception as e:
+        logger.exception("Error in norm search")
+        await status_msg.edit_text(f"Error: {str(e)[:500]}")
+
+
 async def memory_cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue callback for weekly memory cleanup"""
     logger.info("Running scheduled memory cleanup...")
@@ -2059,6 +2538,12 @@ def main():
     app.add_handler(CommandHandler("setsync", set_sync))
     app.add_handler(CommandHandler("syncnow", sync_now))
     app.add_handler(CommandHandler("export", export_response))
+
+    # Phase 1 Quick Wins - new commands
+    app.add_handler(CommandHandler("summary", handle_summary))
+    app.add_handler(CommandHandler("generate_rfi", handle_generate_rfi))
+    app.add_handler(CommandHandler("rfi", handle_generate_rfi))  # alias
+    app.add_handler(CommandHandler("norm", handle_norm))
 
     # Callback handler for export buttons
     app.add_handler(CallbackQueryHandler(handle_export_callback, pattern="^export_"))
