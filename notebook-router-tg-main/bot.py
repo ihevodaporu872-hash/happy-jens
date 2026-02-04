@@ -1668,7 +1668,10 @@ async def _dispatch_action_intent(
 
     if action == "set_sync":
         store_name = action_args.get("store_name") or extract_target_store_hint(question_text)
-        urls = action_args.get("urls") or [u for u, _, _ in GoogleDriveClient.extract_all_urls(question_text)]
+        urls = action_args.get("urls")
+        if isinstance(urls, str):
+            urls = [urls]
+        urls = urls or [u for u, _, _ in GoogleDriveClient.extract_all_urls(question_text)]
         if not store_name or not urls:
             await update.message.reply_text(
                 "Please specify store and URLs.\n"
@@ -1681,7 +1684,10 @@ async def _dispatch_action_intent(
 
     if action == "upload_url":
         store_name = action_args.get("store_name") or extract_target_store_hint(question_text)
-        urls = action_args.get("urls") or [u for u, _, _ in GoogleDriveClient.extract_all_urls(question_text)]
+        urls = action_args.get("urls")
+        if isinstance(urls, str):
+            urls = [urls]
+        urls = urls or [u for u, _, _ in GoogleDriveClient.extract_all_urls(question_text)]
         if not store_name or not urls:
             await update.message.reply_text(
                 "Please specify store and Google URL(s).\n"
