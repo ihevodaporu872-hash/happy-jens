@@ -1485,9 +1485,9 @@ async def handle_folder_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         await status_msg.edit_text(f"Uploading {len(downloaded)} files...")
 
-    success_count = 0
-    error_count = 0
-    storage_exhausted = False
+        success_count = 0
+        error_count = 0
+        storage_exhausted = False
         for file_path, file_name in downloaded:
             if gemini_client.upload_file(store_id, file_path, file_name, source_url=url):
                 success_count += 1
