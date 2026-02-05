@@ -151,6 +151,35 @@ def _get_selected_store_for_user(user_id: int) -> Optional[dict]:
     return None
 
 
+def _select_store_for_query(processed, question: str, user_id: int) -> dict:
+    """Select the best store for a query based on intent, selection, and routing."""
+    target_store_name = processed.target_store or extract_target_store_hint(question)
+    store = None
+
+    if target_store_name:
+        store = gemini_client.find_store_by_name(target_store_name)
+
+    if not store:
+        selected_store = _get_selected_store_for_user(user_id)
+        if selected_store:
+            store = selected_store
+
+    if not store:
+        if router and len(gemini_client.stores) > 1:
+            selected, _ = router.route_with_reasoning(
+                processed.optimized_prompt,
+                max_notebooks=1
+            )
+            if selected:
+                store = selected[0]
+            else:
+                store = gemini_client.stores[0]
+        else:
+            store = gemini_client.stores[0]
+
+    return store
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     if not check_user_allowed(update.effective_user.id):
@@ -1907,32 +1936,36 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("Не удалось определить stores для сравнения.")
             return
 
+        if processed.query_type == "sources":
+            store = _select_store_for_query(processed, question, user_id)
+
+            await status_msg.edit_text(
+                f"{intent_text}\n\n"
+                f"Собираю источники из {store.get('name')}..."
+            )
+
+            sources_text = gemini_client.format_sources_list(store["id"], limit=100)
+            if sources_text:
+                memory_client.add_message(user_id, store["id"], "assistant", sources_text)
+                await _send_answer(status_msg, update, sources_text, context, question, store.get("name", ""))
+                return
+
+            docs_count = len(store.get("documents", []))
+            if docs_count == 0:
+                await status_msg.edit_text(
+                    "Источники не найдены.\n"
+                    "В этом store нет документов или загрузка не завершилась."
+                )
+            else:
+                await status_msg.edit_text(
+                    "Источники не найдены.\n"
+                    "Документы загружены без ссылок на источник."
+                )
+            return
+
         # Single store query (default)
         # Prefer explicit target store from AI or user selection
-        target_store_name = processed.target_store or extract_target_store_hint(question)
-        store = None
-
-        if target_store_name:
-            store = gemini_client.find_store_by_name(target_store_name)
-
-        if not store:
-            selected_store = _get_selected_store_for_user(user_id)
-            if selected_store:
-                store = selected_store
-
-        # Route to best store if multiple available and no explicit selection
-        if not store:
-            if router and len(gemini_client.stores) > 1:
-                selected, reasoning = router.route_with_reasoning(
-                    processed.optimized_prompt,
-                    max_notebooks=1
-                )
-                if selected:
-                    store = selected[0]
-                else:
-                    store = gemini_client.stores[0]
-            else:
-                store = gemini_client.stores[0]
+        store = _select_store_for_query(processed, question, user_id)
 
         await status_msg.edit_text(
             f"{intent_text}\n\n"

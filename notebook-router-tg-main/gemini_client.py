@@ -894,6 +894,36 @@ class GeminiFileSearchClient:
 
         return "\n".join(lines)
 
+    def format_sources_list(self, store_id: str, limit: Optional[int] = None) -> str:
+        """
+        Format a full sources list for a store.
+
+        Args:
+            store_id: Store resource name
+            limit: Optional max number of sources to include
+
+        Returns:
+            Formatted sources list or empty string if none
+        """
+        sources = self.get_store_sources(store_id)
+        if not sources:
+            return ""
+
+        max_items = limit if isinstance(limit, int) and limit > 0 else len(sources)
+        lines = ["Источники:"]
+        for src in sources[:max_items]:
+            name = src.get("name", "Unknown")
+            url = src.get("source_url", "")
+            if url:
+                lines.append(f"- {name}: {url}")
+            else:
+                lines.append(f"- {name}")
+
+        if max_items < len(sources):
+            lines.append(f"Показаны первые {max_items} из {len(sources)}.")
+
+        return "\n".join(lines)
+
     def ask_with_sources(
         self,
         store_id: str,

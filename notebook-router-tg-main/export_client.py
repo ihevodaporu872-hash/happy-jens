@@ -77,6 +77,8 @@ class ExportClient:
             from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
             from reportlab.lib.units import cm
             from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
 
             filename = self._generate_filename(title, ".pdf")
             filepath = self.temp_dir / filename
@@ -90,12 +92,30 @@ class ExportClient:
                 bottomMargin=2*cm
             )
 
+            # Register a Unicode-capable font for Cyrillic support
+            font_name = "Helvetica"
+            font_path_candidates = [
+                "C:\\Windows\\Fonts\\arial.ttf",
+                "C:\\Windows\\Fonts\\ARIAL.TTF",
+                "C:\\Windows\\Fonts\\segoeui.ttf",
+                "C:\\Windows\\Fonts\\Tahoma.ttf",
+            ]
+            for font_path in font_path_candidates:
+                if Path(font_path).exists():
+                    try:
+                        pdfmetrics.registerFont(TTFont("AppFont", font_path))
+                        font_name = "AppFont"
+                        break
+                    except Exception:
+                        continue
+
             styles = getSampleStyleSheet()
 
             # Custom styles
             title_style = ParagraphStyle(
                 'CustomTitle',
                 parent=styles['Heading1'],
+                fontName=font_name,
                 fontSize=16,
                 spaceAfter=12,
                 textColor=colors.HexColor('#1a1a2e')
@@ -104,6 +124,7 @@ class ExportClient:
             meta_style = ParagraphStyle(
                 'Meta',
                 parent=styles['Normal'],
+                fontName=font_name,
                 fontSize=10,
                 textColor=colors.HexColor('#666666'),
                 spaceAfter=6
@@ -112,6 +133,7 @@ class ExportClient:
             body_style = ParagraphStyle(
                 'Body',
                 parent=styles['Normal'],
+                fontName=font_name,
                 fontSize=11,
                 leading=16,
                 spaceAfter=8
