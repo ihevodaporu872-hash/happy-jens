@@ -11,6 +11,10 @@ import time
 import concurrent.futures
 from pathlib import Path
 from typing import Optional, List, Dict, Literal
+import mimetypes
+import shutil
+import tempfile
+import uuid
 
 from google import genai
 from google.genai import types
@@ -131,13 +135,50 @@ class GeminiFileSearchClient:
         try:
             from datetime import datetime
 
+            if not file_path or not Path(file_path).exists():
+                logger.error(f"Upload failed: {file_path} is not a valid file path.")
+                return False
+
             if not display_name:
                 display_name = file_path.name
 
+            # Skip known system files
+            if file_path.name.lower() in {"thumbs.db", ".ds_store"}:
+                logger.info(f"Skipping system file: {file_path.name}")
+                return False
+
+            # Ensure ASCII-safe temp path for upload (Gemini client may fail on non-ASCII paths)
+            temp_dir = None
+            safe_path = file_path
+            try:
+                str(file_path).encode("ascii")
+            except UnicodeEncodeError:
+                temp_dir = Path(tempfile.mkdtemp(prefix="fs_upload_"))
+                safe_name = f"file_{uuid.uuid4().hex}{file_path.suffix}"
+                safe_path = temp_dir / safe_name
+                shutil.copy2(file_path, safe_path)
+
+            # Determine mime type
+            mime_type, _ = mimetypes.guess_type(str(file_path))
+            if not mime_type:
+                ext = file_path.suffix.lower()
+                mime_fallback = {
+                    ".pdf": "application/pdf",
+                    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ".doc": "application/msword",
+                    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    ".xls": "application/vnd.ms-excel",
+                    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    ".ppt": "application/vnd.ms-powerpoint",
+                    ".txt": "text/plain",
+                    ".csv": "text/csv",
+                }
+                mime_type = mime_fallback.get(ext, "application/octet-stream")
+
             operation = self.client.file_search_stores.upload_to_file_search_store(
-                file=str(file_path),
+                file=str(safe_path),
                 file_search_store_name=store_id,
-                config={'display_name': display_name}
+                config={'display_name': display_name, 'mime_type': mime_type}
             )
 
             if wait:
@@ -168,6 +209,12 @@ class GeminiFileSearchClient:
         except Exception as e:
             logger.error(f"Failed to upload file: {e}")
             return False
+        finally:
+            try:
+                if 'temp_dir' in locals() and temp_dir:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     def ask_question(
         self,
