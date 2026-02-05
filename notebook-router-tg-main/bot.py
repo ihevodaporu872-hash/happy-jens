@@ -470,6 +470,9 @@ async def upload_from_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         else:
                             error_count += 1
                             results.append(f"- {file_name} (upload failed)")
+                            if gemini_client.last_upload_error == "resource_exhausted":
+                                results.append("! Storage limit exhausted. Upload stopped.")
+                                break
                         file_path.unlink(missing_ok=True)
                     else:
                         error_count += 1
@@ -1482,18 +1485,38 @@ async def handle_folder_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         await status_msg.edit_text(f"Uploading {len(downloaded)} files...")
 
-        success_count = 0
+    success_count = 0
+    error_count = 0
+    storage_exhausted = False
         for file_path, file_name in downloaded:
             if gemini_client.upload_file(store_id, file_path, file_name, source_url=url):
                 success_count += 1
+            else:
+                error_count += 1
+                if gemini_client.last_upload_error == "resource_exhausted":
+                    storage_exhausted = True
+                    file_path.unlink(missing_ok=True)
+                    break
             file_path.unlink(missing_ok=True)
 
         import shutil
         shutil.rmtree(temp_dir, ignore_errors=True)
 
         if success_count == 0:
-            await status_msg.edit_text("Failed to upload files.")
+            await status_msg.edit_text(
+                "Failed to upload files.\n"
+                "Possible reasons: unsupported file types or storage limit reached."
+            )
             gemini_client.delete_store(store_id)
+            return True
+
+        if storage_exhausted:
+            await status_msg.edit_text(
+                f"Uploaded {success_count} files, but storage limit is exhausted.\n"
+                "Some files were skipped. Please delete old stores or upgrade your Gemini quota."
+            )
+            if router:
+                router.reload_library()
             return True
 
         # Analyze content with Gemini Pro to get name and description
@@ -1946,10 +1969,18 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             memory_client.add_message(user_id, store["id"], "assistant", answer)
             await _send_answer(status_msg, update, answer, context, question, store.get("name", ""))
         else:
-            await status_msg.edit_text(
-                "No answer received.\n"
-                "The store might be empty or the question couldn't be answered."
-            )
+            docs_count = len(store.get("documents", []))
+            if docs_count == 0:
+                await status_msg.edit_text(
+                    "No answer received.\n"
+                    "The store has no documents or uploads failed.\n"
+                    "Try re-uploading or check Gemini storage quota."
+                )
+            else:
+                await status_msg.edit_text(
+                    "No answer received.\n"
+                    "The store might still be indexing documents. Please try again in a few minutes."
+                )
 
     except Exception as e:
         logger.exception("Error handling question")

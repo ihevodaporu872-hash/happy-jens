@@ -15,6 +15,7 @@ import mimetypes
 import shutil
 import tempfile
 import uuid
+import re
 
 from google import genai
 from google.genai import types
@@ -47,6 +48,7 @@ class GeminiFileSearchClient:
         self.client = genai.Client(api_key=api_key)
         self.stores_file = stores_file
         self.stores: List[Dict] = []
+        self.last_upload_error: Optional[str] = None
         self._load_stores()
 
     def _load_stores(self):
@@ -135,8 +137,11 @@ class GeminiFileSearchClient:
         try:
             from datetime import datetime
 
+            self.last_upload_error = None
+
             if not file_path or not Path(file_path).exists():
                 logger.error(f"Upload failed: {file_path} is not a valid file path.")
+                self.last_upload_error = "invalid_path"
                 return False
 
             if not display_name:
@@ -145,6 +150,7 @@ class GeminiFileSearchClient:
             # Skip known system files
             if file_path.name.lower() in {"thumbs.db", ".ds_store"}:
                 logger.info(f"Skipping system file: {file_path.name}")
+                self.last_upload_error = "skipped_system_file"
                 return False
 
             # Ensure ASCII-safe temp path for upload (Gemini client may fail on non-ASCII paths)
@@ -175,10 +181,19 @@ class GeminiFileSearchClient:
                 }
                 mime_type = mime_fallback.get(ext, "application/octet-stream")
 
+            # Ensure mime_type is valid, otherwise omit it
+            mime_type = mime_type.strip() if isinstance(mime_type, str) else ""
+            if not re.match(r"^[^/\\s]+/[^/\\s]+$", mime_type):
+                mime_type = ""
+
+            config = {'display_name': display_name}
+            if mime_type:
+                config['mime_type'] = mime_type
+
             operation = self.client.file_search_stores.upload_to_file_search_store(
                 file=str(safe_path),
                 file_search_store_name=store_id,
-                config={'display_name': display_name, 'mime_type': mime_type}
+                config=config
             )
 
             if wait:
@@ -208,6 +223,17 @@ class GeminiFileSearchClient:
 
         except Exception as e:
             logger.error(f"Failed to upload file: {e}")
+            msg = str(e)
+            if "RESOURCE_EXHAUSTED" in msg or "storage limit" in msg:
+                self.last_upload_error = "resource_exhausted"
+            elif "mime_type" in msg:
+                self.last_upload_error = "invalid_mime"
+            elif "terminated" in msg:
+                self.last_upload_error = "upload_terminated"
+            elif "INVALID_ARGUMENT" in msg or "invalid argument" in msg:
+                self.last_upload_error = "invalid_argument"
+            else:
+                self.last_upload_error = "unknown"
             return False
         finally:
             try:
